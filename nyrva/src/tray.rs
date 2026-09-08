@@ -14,7 +14,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip(concat!("Codenotch v", env!("CARGO_PKG_VERSION")))
+        .tooltip(concat!("Nyrva v", env!("CARGO_PKG_VERSION")))
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, ev| handle(app, ev.id().as_ref()))
@@ -47,7 +47,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let reset = MenuItemBuilder::with_id("reset", tr(lang, "reset_pos")).build(app)?;
     let open_data = MenuItemBuilder::with_id("open-data", tr(lang, "open_data")).build(app)?;
     let auto = CheckMenuItemBuilder::with_id("autostart", tr(lang, "autostart"))
-        .checked(crate::autostart::is_enabled())
+        .checked(crate::platform::autostart::is_enabled())
         .build(app)?;
     let quit = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
     MenuBuilder::new(app)
@@ -84,14 +84,7 @@ fn handle(app: &AppHandle, id: &str) {
         "open-data" => {
             let dir = crate::config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
             let _ = std::fs::create_dir_all(crate::glyphs::user_dir());
-            let mut cmd = std::process::Command::new("explorer");
-            cmd.arg(dir.as_os_str());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000);
-            }
-            let _ = cmd.spawn();
+            crate::platform::open_folder(&dir);
         }
         "refresh" => {
             {
@@ -107,10 +100,10 @@ fn handle(app: &AppHandle, id: &str) {
             std::thread::spawn(move || crate::reload_glyphs(&a));
         }
         "autostart" => {
-            let r = if crate::autostart::is_enabled() {
-                crate::autostart::disable()
+            let r = if crate::platform::autostart::is_enabled() {
+                crate::platform::autostart::disable()
             } else {
-                crate::autostart::enable()
+                crate::platform::autostart::enable()
             };
             notice(app, r);
             refresh_menu(app); // refresh the check marks
