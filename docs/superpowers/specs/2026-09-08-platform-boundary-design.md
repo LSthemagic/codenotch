@@ -2,17 +2,24 @@
 
 ## Goal
 
-Prepare the Nyrva Rust/Tauri application for Linux X11 without adding Linux behavior yet by moving Windows-only operating-system code behind a single `platform` boundary.
+Prepare the Nyrva Rust/Tauri application for Linux X11 without adding Linux behavior yet by moving **application infrastructure** that is directly tied to Windows behind a single `platform` boundary.
 
 ## Scope
 
-This milestone is a refactor only. Windows behavior must remain unchanged. Provider protocols, parsing, polling, UI behavior, and persistence formats are not to be redesigned.
+This milestone is a behavior-preserving refactor. Windows behavior must remain unchanged. Provider protocols, parsing, polling, UI behavior, and persistence formats are not redesigned.
 
 The implementation is stacked on top of `feat/nyrva-foundation`.
 
+During repository inspection, the Windows coupling separated naturally into two groups:
+
+1. application infrastructure: window behavior, shell/opening, focus, locale, autostart and console attachment;
+2. provider-specific adapters: Antigravity Credential Manager access, EXE icon extraction and activity IO counters.
+
+This milestone extracts group 1. Group 2 stays with each provider until its Linux provider implementation is introduced, avoiding a premature move of provider logic into a generic platform package.
+
 ## Chosen approach
 
-Use a small module facade rather than introducing a large trait/object graph now.
+Use a small module facade rather than introducing a trait/object graph now.
 
 ```text
 nyrva/src/
@@ -22,104 +29,95 @@ nyrva/src/
 │       ├── mod.rs
 │       ├── autostart.rs
 │       ├── focus.rs
-│       ├── process.rs
+│       ├── locale.rs
 │       ├── shell.rs
 │       └── window.rs
 ├── main.rs
-├── activity.rs
-├── antigravity.rs
-├── diag.rs
-├── glyphs.rs
+├── tray.rs
+├── i18n.rs
 └── ...
 ```
 
-`platform/mod.rs` is the only OS-facing API consumed by shared code. On Windows it delegates to `platform::windows`. Linux modules are deliberately not added in this milestone.
+`platform/mod.rs` is the shared OS-facing facade. On Windows it delegates to `platform::windows`. Linux modules are deliberately not added in this milestone.
 
-This is preferred over a trait-heavy design because the application currently has one concrete platform implementation and many operations are process-global functions. A trait layer would add indirection without yet providing useful runtime polymorphism. If Linux later needs injectable behavior for tests, traits can be introduced around the specific seams that need them.
+This is preferred over a trait-heavy design because there is currently one concrete implementation and these operations are process-global functions. Runtime polymorphism would add indirection without useful capability yet.
 
 ## Platform responsibilities
 
 ### `platform/windows/window.rs`
 
-Own Win32 window/input details:
+Own direct Win32 window/input details:
 
 - left mouse button state used by notch dragging;
 - `WS_EX_NOACTIVATE` / `WS_EX_TOOLWINDOW` application;
-- direct Windows window/input calls.
+- parent-console attachment.
 
-Tauri-level monitor sizing and `set_position` remain in shared `main.rs` for now because the same API is expected to be reused by the Linux X11 implementation. Only direct Win32 calls move.
+Tauri monitor sizing and `set_position` remain in shared `main.rs` because the same high-level API is expected to be reused by Linux X11.
 
 ### `platform/windows/shell.rs`
 
 Own Windows shell integration:
 
 - open a directory with Explorer;
-- open a URL using the Windows shell;
-- hide console windows for spawned helper commands where required.
+- open a URL through the Windows shell;
+- Windows-only `CommandExt::creation_flags` needed for these commands.
 
-Shared code must no longer invoke `explorer`, `cmd /C start`, or `CommandExt::creation_flags` directly.
+Shared application infrastructure must no longer invoke `explorer` or `cmd /C start` directly.
 
 ### `platform/windows/autostart.rs`
 
-Move the current HKCU `Run` implementation here unchanged in behavior. Shared tray/command code calls a neutral `platform::autostart::{is_enabled, enable, disable}` facade.
-
-### `platform/windows/process.rs`
-
-Own Windows process inspection primitives that are currently spread across focus/activity/diagnostic helpers:
-
-- process snapshot (`pid`, `ppid`, executable name);
-- foreground PID;
-- ancestor-chain helper;
-- Windows process/window lookup primitives needed by focus and activity logic;
-- low-priority/thread/process helpers that require Win32 APIs.
-
-Pure provider classification remains outside this module.
+Move the current HKCU `Run` implementation here unchanged in behavior. Shared code calls `platform::autostart::{is_enabled, enable, disable}`.
 
 ### `platform/windows/focus.rs`
 
-Own Windows-specific terminal and Claude Desktop focus behavior. Shared code calls neutral platform functions such as `focus_terminal(pid)` and `focus_claude_desktop()`.
+Own the existing Windows terminal/Claude Desktop focus code and its process/window snapshot helpers. This file is moved as one cohesive Windows implementation to avoid changing its runtime algorithm in the same commit as the architecture refactor.
+
+### `platform/windows/locale.rs`
+
+Own `GetUserDefaultLocaleName`. `i18n.rs` remains responsible for mapping the resulting language to application translations.
 
 ## Shared-code rules
 
 After this milestone:
 
 - `main.rs` contains no direct `windows::Win32::*` imports;
-- `main.rs` does not directly spawn `explorer` or `cmd /C start`;
-- top-level `autostart.rs` and `focus.rs` are removed in favor of the platform facade;
-- providers are not moved wholesale into the platform layer;
-- cross-platform paths based on `dirs` stay shared unless their actual path differs by OS;
+- `main.rs` and `tray.rs` do not directly spawn `explorer` or `cmd /C start`;
+- application focus/autostart/locale/window integration is reached through `platform`;
+- provider files are not moved wholesale into the platform layer;
+- cross-platform paths based on `dirs` stay shared;
 - no Linux implementation or fake Linux stubs are added solely to make the architecture look complete.
+
+Provider-specific Windows adapters that remain are documented debt for the Linux-provider milestones, not hidden as completed work.
 
 ## Error behavior
 
 Platform operations preserve the current failure model:
 
-- UI convenience operations (open URL/folder, focus) fail quietly or return `false` as they do today;
-- autostart retains `Result<String, String>` responses;
-- process discovery returns empty/default data when OS inspection fails;
+- open URL/folder and focus operations fail quietly or return `false` as today;
+- autostart retains `Result<String, String>`;
+- focus/process discovery returns empty/default data on OS inspection failure;
 - no new user-visible error states are introduced.
 
-## Testing and verification
+## Verification
 
-Because this is behavior-preserving refactoring, tests focus on pure logic extracted from Win32 calls plus build validation.
-
-Add unit tests for the ancestor-chain/process matching helper so that logic can be exercised without Win32.
-
-Required Windows verification from repo root:
+Required Windows verification from repository root:
 
 ```text
 cargo check --workspace
 cargo test --workspace
 ```
 
-CI also checks that direct `windows::Win32` imports do not appear outside `nyrva/src/platform/windows/`.
+Review additionally verifies that `main.rs`, `tray.rs`, and `i18n.rs` no longer contain direct Win32/shell integration.
+
+Because GitHub Actions has not produced a run for the foundation PR yet, verification status must be reported truthfully; no passing-build claim is allowed without actual output.
 
 ## Non-goals
 
 - Linux X11 implementation;
 - Wayland support;
+- provider-specific Credential Manager / EXE icon / IO-counter extraction;
 - changing the notch placement algorithm;
 - changing providers or provider endpoints;
 - UI redesign;
 - dynamic runtime platform selection;
-- adding a general-purpose dependency-injection framework.
+- dependency-injection framework.
