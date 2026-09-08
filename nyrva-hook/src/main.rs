@@ -78,3 +78,23 @@ fn parent_pid() -> u32 {
 
 #[cfg(not(windows))]
 fn parent_pid() -> u32 { std::os::unix::process::parent_id() }
+
+#[cfg(test)]
+mod tests {
+    use super::{config_path, main_binary_name};
+    use std::path::Path;
+
+    #[test]
+    fn main_binary_name_matches_platform() {
+        #[cfg(windows)]
+        assert_eq!(main_binary_name(), "nyrva.exe");
+        #[cfg(target_os = "linux")]
+        assert_eq!(main_binary_name(), "nyrva");
+    }
+
+    #[test]
+    fn config_path_uses_nyrva_config_namespace() {
+        let path = config_path().expect("config directory should be available in supported desktop environments");
+        assert!(path.ends_with(Path::new("nyrva").join("config.json")));
+    }
+}
