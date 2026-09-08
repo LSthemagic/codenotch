@@ -1,0 +1,9 @@
+[package]
+name = "nyrva-hook"
+version = "0.3.0"
+edition = "2021"
+description = "Nyrva hook launcher: report Claude Code hook events and auto-start the main app"
+license = "MIT"
+repository = "https://github.com/LSthemagic/nyrva"
+
+[dependencies]
