@@ -8,4 +8,9 @@ Ruling: Tasks 1-3 must reach a compile-complete Linux platform facade before the
 
 Task 1 RED: Ubuntu 22.04 `cargo check --workspace` failed as expected on missing Linux platform implementations; Windows `cargo check` passed. Linux system dependencies installed successfully.
 
-Task 6 (partial): Linux CI job added early; implementation tasks still pending.
+Task 1: complete — Linux platform selection, locale detection/tests, and conservative focus compatibility implemented.
+Task 2: complete — `xdg-open` integration and X11 Button1 query via x11rb implemented and tested.
+Task 3: complete — XDG autostart renderer/path/enable/disable behavior implemented and tested.
+Verification: GitHub Actions run 34292556612 passed on both Windows and Ubuntu 22.04: `cargo check --workspace` + `cargo test --workspace`.
+
+Task 6 (partial): Linux CI job added early; final implementation gate still pending.
