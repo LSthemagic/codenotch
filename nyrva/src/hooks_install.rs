@@ -1,4 +1,4 @@
-//! Merges nyrva-hook.exe into ~/.claude/settings.json without overwriting the user's own hooks.
+//! Merges the Nyrva hook into ~/.claude/settings.json without overwriting the user's own hooks.
 //! Identification accepts both Nyrva and legacy Codenotch hook commands so upgrades can cleanly replace older entries.
 
 use serde_json::{json, Value};
@@ -99,4 +99,17 @@ pub fn uninstall() -> Result<String, String> {
     }
     backup_and_write(&path, &root)?;
     Ok(format!("removed {removed} Nyrva hook(s)"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hook_binary_name;
+
+    #[test]
+    fn hook_binary_name_matches_platform() {
+        #[cfg(windows)]
+        assert_eq!(hook_binary_name(), "nyrva-hook.exe");
+        #[cfg(target_os = "linux")]
+        assert_eq!(hook_binary_name(), "nyrva-hook");
+    }
 }
