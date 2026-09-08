@@ -6,6 +6,7 @@ mod doctor;
 mod focus;
 mod hooks_install;
 mod i18n;
+mod platform;
 mod server;
 mod state;
 mod tray;
@@ -129,16 +130,6 @@ pub fn reset_bar(app: &AppHandle) {
 /// ratio is written back to the config.
 static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(windows)]
-fn left_button_down() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
-}
-#[cfg(not(windows))]
-fn left_button_down() -> bool {
-    false
-}
-
 #[tauri::command]
 fn drag_begin(app: AppHandle) {
     if DRAGGING.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -162,7 +153,7 @@ fn drag_begin(app: AppHandle) {
         let mut last_y = start_pos.y;
         let mut moved = false;
         loop {
-            if !left_button_down() {
+            if !platform::left_button_down() {
                 break;
             }
             if let Ok(cur) = app.cursor_position() {
@@ -210,30 +201,6 @@ pub fn apply_lang(app: &AppHandle, lang: &str) {
     }
     broadcast(app);
 }
-
-/// The notch must never take focus: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
-#[cfg(windows)]
-fn noactivate(app: &AppHandle) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    };
-    if let Some(w) = app.get_webview_window("notch") {
-        if let Ok(h) = w.hwnd() {
-            unsafe {
-                let hwnd =
-                    windows::Win32::Foundation::HWND(h.0 as isize as *mut core::ffi::c_void);
-                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                SetWindowLongPtrW(
-                    hwnd,
-                    GWL_EXSTYLE,
-                    ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize,
-                );
-            }
-        }
-    }
-}
-#[cfg(not(windows))]
-fn noactivate(_app: &AppHandle) {}
 
 // ---------------- commands ----------------
 
@@ -289,14 +256,7 @@ pub fn reload_glyphs(app: &AppHandle) {
 fn open_data_dir() {
     let dir = config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let _ = std::fs::create_dir_all(glyphs::user_dir());
-    let mut cmd = std::process::Command::new("explorer");
-    cmd.arg(dir.as_os_str());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let _ = cmd.spawn();
+    platform::open_folder(&dir);
 }
 
 #[tauri::command]
@@ -318,14 +278,7 @@ fn open_provider_page(provider: String) {
         "gemini" => "https://antigravity.google",
         _ => "https://claude.ai/settings/usage",
     };
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let _ = cmd.spawn();
+    platform::open_url(url);
 }
 
 /// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's
@@ -457,14 +410,7 @@ fn log_js(msg: String) {
 
 #[tauri::command]
 fn open_usage_page() {
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", "https://claude.ai/settings/usage"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let _ = cmd.spawn();
+    platform::open_url("https://claude.ai/settings/usage");
 }
 
 #[tauri::command]
@@ -512,7 +458,7 @@ fn ack_scan(app: &AppHandle) -> bool {
     }
     let maps = focus::proc_maps();
     let fg_name = maps.name.get(&fg).cloned().unwrap_or_default();
-    let fg_is_claude_desktop = fg_name.contains("claude") && !fg_name.contains("codenotch");
+    let fg_is_claude_desktop = fg_name.contains("claude") && !fg_name.contains("nyrva");
     let st = app.state::<AppState>();
     let mut store = st.store.lock().unwrap();
     store.ack_done(|s| {
@@ -530,16 +476,6 @@ fn ack_scan(_app: &AppHandle) -> bool {
 
 // ---------------- main ----------------
 
-#[cfg(windows)]
-fn attach_console() {
-    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-    unsafe {
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
-}
-#[cfg(not(windows))]
-fn attach_console() {}
-
 fn report(r: Result<String, String>) {
     let msg = match r {
         Ok(m) => format!("OK: {m}"),
@@ -551,7 +487,7 @@ fn report(r: Result<String, String>) {
 }
 
 fn main() {
-    attach_console();
+    platform::attach_parent_console();
     let args: Vec<String> = std::env::args().collect();
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {
@@ -567,7 +503,7 @@ fn main() {
                 let r = match args.get(2).map(|s| s.as_str()) {
                     Some("on") => autostart::enable(),
                     Some("off") => autostart::disable(),
-                    _ => Err("usage: codenotch.exe autostart on|off".into()),
+                    _ => Err("usage: nyrva.exe autostart on|off".into()),
                 };
                 report(r);
                 return;
@@ -591,7 +527,7 @@ fn main() {
             // Launching a freshly built exe while the old one is still running lands here: the new
             // instance is turned away and what stays on screen is the old process. Say so loudly.
             applog(&format!("single instance: another launch was refused; the running instance is build={BUILD} — quit it from the tray first if you just rebuilt"));
-            let _ = app.emit("notice", format!("Codenotch is already running ({BUILD}) — quit it from the tray before starting a new build"));
+            let _ = app.emit("notice", format!("Nyrva is already running ({BUILD}) — quit it from the tray before starting a new build"));
         }))
         .manage(AppState {
             store: Mutex::new(Default::default()),
@@ -626,7 +562,7 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             place_notch(&handle);
-            noactivate(&handle);
+            platform::apply_noactivate(&handle);
             if let Some(w) = handle.get_webview_window("notch") {
                 let _ = w.show();
             }
@@ -666,7 +602,7 @@ fn main() {
                     broadcast(&sweeper);
                 }
             });
-            // Persist the config (codenotch-hook reads the port from it)
+            // Persist the config (nyrva-hook reads the port from it)
             {
                 let st = handle.state::<AppState>();
                 let c = st.cfg.lock().unwrap();
@@ -675,5 +611,5 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("Codenotch failed to start");
+        .expect("Nyrva failed to start");
 }
