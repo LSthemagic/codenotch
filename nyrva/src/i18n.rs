@@ -1,25 +1,7 @@
 //! Rust-side (tray menu) strings. The page has its own dictionary; keys are kept identical on both sides.
 
 pub fn resolve_auto() -> &'static str {
-    #[cfg(windows)]
-    unsafe {
-        use windows::Win32::Globalization::GetUserDefaultLocaleName;
-        let mut buf = [0u16; 85];
-        let n = GetUserDefaultLocaleName(&mut buf);
-        if n > 0 {
-            let name = String::from_utf16_lossy(&buf[..(n as usize - 1)]).to_lowercase();
-            if name.starts_with("zh") {
-                return "zh";
-            }
-            if name.starts_with("ja") {
-                return "ja";
-            }
-            if name.starts_with("ko") {
-                return "ko";
-            }
-        }
-    }
-    "en"
+    crate::platform::system_language()
 }
 
 pub fn tr(lang: &str, key: &str) -> &'static str {
