@@ -75,8 +75,12 @@ jobs:
           appimage="$(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
           test -n "$deb"
           test -n "$appimage"
+          echo "deb=$deb"
+          echo "appimage=$appimage"
 
-          dpkg-deb -c "$deb" | grep -Eq '\./usr/bin/nyrva-hook$'
+          echo "::group::deb Nyrva entries"
+          dpkg-deb -c "$deb" | grep -Ei 'nyrva|hook|usr/bin' || true
+          echo "::endgroup::"
 
           appimage="$(realpath "$appimage")"
           chmod +x "$appimage"
@@ -85,4 +89,9 @@ jobs:
             cd "$extract_dir"
             "$appimage" --appimage-extract >/dev/null
           )
+          echo "::group::AppImage Nyrva entries"
+          find "$extract_dir/squashfs-root" -maxdepth 6 \( -type f -o -type l \) -print | grep -Ei 'nyrva|hook|usr/bin' || true
+          echo "::endgroup::"
+
+          dpkg-deb -c "$deb" | grep -Eq '\./usr/bin/nyrva-hook$'
           test -x "$extract_dir/squashfs-root/usr/bin/nyrva-hook"
