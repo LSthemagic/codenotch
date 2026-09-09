@@ -2,8 +2,10 @@
 //!
 //! Data path (same trade-off as upstream: borrow the editor's own session):
 //!   1. Credential: the editor keeps its sign-in in the global state database it inherited from
-//!      VS Code, `%APPDATA%\Cursor\User\globalStorage\state.vscdb` (SQLite, table ItemTable(key,value)):
-//!      `cursorAuth/accessToken` + `cursorAuth/stripeMembershipAuthId`, joined into the cookie
+//!      VS Code: `%APPDATA%\Cursor\User\globalStorage\state.vscdb` on Windows and
+//!      `${XDG_CONFIG_HOME:-~/.config}/Cursor/User/globalStorage/state.vscdb` on Linux (SQLite,
+//!      table ItemTable(key,value)). Nyrva reads `cursorAuth/accessToken` +
+//!      `cursorAuth/stripeMembershipAuthId`, joined into the cookie
 //!      `WorkosCursorSessionToken=<authId>::<token>`. Non-secret identity cache:
 //!      `cursorAuth/cachedEmail`, `cursorAuth/stripeMembershipType` (only the plan is shown).
 //!   2. Endpoint: `GET https://cursor.com/api/usage-summary` (Cookie + Accept: application/json, 15 s).
@@ -16,14 +18,15 @@
 //!      0 is a reading, not a gap (upstream's lesson). "API usage" is listed separately when
 //!      apiPercentUsed > 0; "On demand" when onDemand has a real limit.
 //!
-//! SQLite opening rule: `mode=ro` first (it sees the token the editor just rotated into the WAL),
-//! then `immutable=1` (once the editor has exited and the -shm is gone, mode=ro fails to open; by
-//! then the WAL has been checkpointed, so ignoring it costs nothing).
+//! SQLite opening rule: plain read-only first (it sees the token the editor just rotated into the
+//! WAL), then `immutable=1` (once the editor has exited and the -shm is gone, plain read-only may
+//! fail to read; by then the WAL has been checkpointed, so ignoring it costs nothing).
 //! Read only, never written; token values never reach logs, events or the UI.
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -43,9 +46,40 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Windows: %APPDATA%\Cursor\User\globalStorage\state.vscdb (macOS: ~/Library/Application Support/Cursor/...)
+fn cursor_state_path(config_dir: &Path) -> PathBuf {
+    config_dir
+        .join("Cursor")
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb")
+}
+
+fn linux_config_dir_from(xdg: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    xdg.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".config")))
+}
+
+#[cfg(windows)]
+fn cursor_config_dir() -> Option<PathBuf> {
+    dirs::config_dir()
+}
+
+#[cfg(target_os = "linux")]
+fn cursor_config_dir() -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = dirs::home_dir();
+    linux_config_dir_from(xdg.as_deref(), home.as_deref())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn cursor_config_dir() -> Option<PathBuf> {
+    dirs::config_dir()
+}
+
+/// Windows: `%APPDATA%/Cursor/...`; Linux: `${XDG_CONFIG_HOME:-~/.config}/Cursor/...`.
 pub fn store_url() -> Option<PathBuf> {
-    dirs::config_dir().map(|c| c.join("Cursor").join("User").join("globalStorage").join("state.vscdb"))
+    cursor_config_dir().map(|config| cursor_state_path(&config))
 }
 
 fn store_path() -> PathBuf {
@@ -77,8 +111,33 @@ pub fn present() -> bool {
 
 // ---------------- SQLite, read only ----------------
 
-/// mode=ro first, immutable=1 as the fallback (see the module doc)
-fn open_ro(path: &std::path::Path) -> Option<rusqlite::Connection> {
+fn encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b':'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~' => out.push(*byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn immutable_uri(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let body = normalized.trim_start_matches('/');
+    format!("file:///{}?immutable=1", encode_uri_path(body))
+}
+
+/// Plain read-only first so a live WAL is visible; immutable URI is only a closed/checkpointed fallback.
+fn open_ro(path: &Path) -> Option<rusqlite::Connection> {
     use rusqlite::OpenFlags;
     if !path.is_file() {
         return None;
@@ -87,15 +146,16 @@ fn open_ro(path: &std::path::Path) -> Option<rusqlite::Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
-        // Actually verify that reads work (with the -shm missing, open can succeed and the first query fail)
-        if c.prepare("SELECT 1 FROM ItemTable LIMIT 1").and_then(|mut s| s.query([]).map(|_| ())).is_ok() {
+        // Actually verify that reads work (with the -shm missing, open can succeed and the first query fail).
+        if c.prepare("SELECT 1 FROM ItemTable LIMIT 1")
+            .and_then(|mut s| s.query([]).map(|_| ()))
+            .is_ok()
+        {
             return Some(c);
         }
     }
-    // Only the URI form takes immutable=1; a Windows path becomes file:///C:/... with \ → /
-    let mut uri = String::from("file:///");
-    uri.push_str(&path.to_string_lossy().replace('\\', "/").trim_start_matches('/').replace('#', "%23").replace('?', "%3F"));
-    uri.push_str("?immutable=1");
+
+    let uri = immutable_uri(path);
     rusqlite::Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -114,7 +174,7 @@ struct Creds {
     plan: Option<String>,
 }
 
-/// Re-read every time: the editor rotates the token, and holding on to an old value signs us out
+/// Re-read every time: the editor rotates the token, and holding on to an old value signs us out.
 fn read_credentials() -> Option<Creds> {
     let path = store_url()?;
     let conn = open_ro(&path)?;
@@ -124,19 +184,27 @@ fn read_credentials() -> Option<Creds> {
     Some(Creds { cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"), plan })
 }
 
-/// For doctor: contains no secret values
+fn credential_probe(cookie_len: usize, plan: Option<&str>) -> String {
+    format!(
+        "Cursor: session borrowed (cookie {cookie_len} chars, plan={})",
+        plan.unwrap_or("?")
+    )
+}
+
+/// For doctor: contains no secret values.
 pub fn probe() -> String {
-    let Some(p) = store_url() else { return "Cursor: cannot locate %APPDATA%".into() };
+    let Some(p) = store_url() else {
+        return "Cursor: cannot locate the configuration directory".into();
+    };
     if !p.is_file() {
         return format!("Cursor: {} not found (not installed, or not signed in)", p.display());
     }
     match read_credentials() {
-        Some(c) => format!(
-            "Cursor: session borrowed (cookie {} chars, plan={})",
-            c.cookie.len(),
-            c.plan.unwrap_or_else(|| "?".into())
+        Some(c) => credential_probe(c.cookie.len(), c.plan.as_deref()),
+        None => format!(
+            "Cursor: {} exists but cursorAuth/* could not be read (editor not signed in, or SQLite failed to open)",
+            p.display()
         ),
-        None => format!("Cursor: {} exists but cursorAuth/* could not be read (editor not signed in, or SQLite failed to open)", p.display()),
     }
 }
 
@@ -152,13 +220,12 @@ fn parse_iso(v: Option<&serde_json::Value>) -> Option<u64> {
         .map(|d| d.timestamp_millis().max(0) as u64)
 }
 
-/// usage-summary → (windows, note). When there are no windows the note says why (Unlimited / free plan without an allowance)
+/// usage-summary → (windows, note). When there are no windows the note says why (Unlimited / free plan without an allowance).
 pub fn parse_summary(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
     let resets_at = parse_iso(v.get("billingCycleEnd"));
     let usage = v.get("individualUsage").cloned().unwrap_or(serde_json::Value::Null);
     let plan = usage.get("plan").cloned().unwrap_or(serde_json::Value::Null);
     let mut out = Vec::new();
-    // Headline = the dashboard number; 0 is a reading too
     if let Some(total) = pct(plan.get("totalPercentUsed")) {
         out.push(LimitWindow { id: "included".into(), label: "Included usage".into(), used: total, resets_at, ..Default::default() });
     }
@@ -177,7 +244,8 @@ pub fn parse_summary(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
                     id: "on_demand".into(),
                     label: "On demand".into(),
                     used: (u / limit).clamp(0.0, 1.0),
-                    resets_at, ..Default::default()
+                    resets_at,
+                    ..Default::default()
                 });
             }
         }
@@ -247,7 +315,6 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
             snap.note = "Cursor session was rejected — sign in again in the editor".into();
         }
         Err(FetchErr::Other(msg)) => {
-            // Stale beats invented: keep the old reading, marked stale
             snap.status = if snap.windows.is_empty() { "error" } else { "stale" }.into();
             snap.note = msg;
         }
@@ -281,7 +348,7 @@ pub fn start(app: AppHandle) {
         if !present() {
             broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
             loop {
-                sleep_interruptible(600); // Cursor is not installed: look again every 10 minutes
+                sleep_interruptible(600);
                 if present() {
                     break;
                 }
@@ -301,4 +368,91 @@ pub fn start(app: AppHandle) {
             sleep_interruptible(POLL_SECS);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn linux_config_prefers_xdg_config_home() {
+        assert_eq!(
+            linux_config_dir_from(Some(OsStr::new("/tmp/xdg")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/tmp/xdg"))
+        );
+    }
+
+    #[test]
+    fn linux_config_falls_back_to_dot_config() {
+        assert_eq!(
+            linux_config_dir_from(Some(OsStr::new("")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.config"))
+        );
+    }
+
+    #[test]
+    fn cursor_state_path_is_shared_shape() {
+        assert_eq!(
+            cursor_state_path(Path::new("/tmp/config")),
+            PathBuf::from("/tmp/config/Cursor/User/globalStorage/state.vscdb")
+        );
+    }
+
+    #[test]
+    fn immutable_uri_handles_unix_path() {
+        assert_eq!(
+            immutable_uri(Path::new("/home/me/Cursor Data/state#?.vscdb")),
+            "file:///home/me/Cursor%20Data/state%23%3F.vscdb?immutable=1"
+        );
+    }
+
+    #[test]
+    fn immutable_uri_handles_windows_shape() {
+        assert_eq!(
+            immutable_uri(Path::new(r"C:\Users\Me\Cursor Data\state.vscdb")),
+            "file:///C:/Users/Me/Cursor%20Data/state.vscdb?immutable=1"
+        );
+    }
+
+    #[test]
+    fn diagnostic_does_not_render_cookie_secret() {
+        let secret = "top-secret-cookie";
+        let rendered = credential_probe(secret.len(), Some("pro"));
+        assert_eq!(rendered, "Cursor: session borrowed (cookie 17 chars, plan=pro)");
+        assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn readonly_open_sees_live_wal() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nyrva-cursor-wal-{}-{stamp}.sqlite", std::process::id()));
+
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 INSERT INTO ItemTable(key,value) VALUES ('cursorAuth/accessToken','fresh-token');",
+            )
+            .unwrap();
+
+        let reader = open_ro(&path).expect("read-only connection should see the live WAL");
+        assert_eq!(item(&reader, "cursorAuth/accessToken").as_deref(), Some("fresh-token"));
+
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(PathBuf::from(wal));
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
+        let _ = std::fs::remove_file(PathBuf::from(shm));
+    }
 }
