@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -17,6 +17,10 @@ pub struct Config {
     pub drag_enabled: bool,
     #[serde(default = "default_notch_y")]
     pub notch_y: f64,
+    /// Executable the persistent hook should launch when Nyrva is not running.
+    /// On AppImage this is the outer AppImage path, never the temporary /tmp/.mount_* path.
+    #[serde(default)]
+    pub launcher_path: String,
 }
 
 fn default_notch_y() -> f64 { 0.5 }
@@ -25,8 +29,24 @@ fn default_lang() -> String { "auto".into() }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { port: default_port(), lang: default_lang(), bar_x: None, bar_y: None, bar_w: None, drag_enabled: false, notch_y: default_notch_y() }
+        Self {
+            port: default_port(),
+            lang: default_lang(),
+            bar_x: None,
+            bar_y: None,
+            bar_w: None,
+            drag_enabled: false,
+            notch_y: default_notch_y(),
+            launcher_path: String::new(),
+        }
     }
+}
+
+pub fn launcher_path_from(appimage: Option<&str>, current_exe: &Path) -> PathBuf {
+    appimage
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_exe.to_path_buf())
 }
 
 pub fn config_path() -> PathBuf {
