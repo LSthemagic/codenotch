@@ -12,10 +12,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare Windows sidecar
+        shell: pwsh
+        run: ./scripts/prepare-windows-sidecar.ps1 debug
       - name: Cargo check
         run: cargo check --workspace
       - name: Cargo test
         run: cargo test --workspace
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+      - name: Prepare release sidecar
+        shell: pwsh
+        run: ./scripts/prepare-windows-sidecar.ps1 release
+      - name: Build Windows NSIS installer
+        working-directory: nyrva
+        run: cargo tauri build
+      - name: Verify Windows installer and hook sidecar
+        shell: pwsh
+        run: |
+          $hostTriple = (rustc -vV | Select-String '^host: ' | ForEach-Object { $_.Line.Substring(6) }).Trim()
+          $sidecar = "nyrva/binaries/nyrva-hook-$hostTriple.exe"
+          if (-not (Test-Path $sidecar)) { throw "missing prepared sidecar: $sidecar" }
+
+          $installer = Get-ChildItem target/release/bundle/nsis -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'missing NSIS installer' }
+          Write-Host "installer=$($installer.FullName)"
+
+          $manifest = (& 7z l $installer.FullName | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw '7z could not inspect the NSIS installer' }
+          if ($manifest -notmatch '(?i)nyrva-hook\.exe') {
+            Write-Host $manifest
+            throw 'NSIS installer does not contain nyrva-hook.exe'
+          }
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyrva-windows
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
 
   linux:
     name: Linux Rust workspace
@@ -59,12 +93,8 @@ jobs:
           status=$?
           if [ "$status" -ne 0 ]; then
             echo "::error::cargo tauri build failed with exit code $status"
-            echo "::group::Relevant Tauri build errors"
             grep -Ei 'error|failed|externalbin|sidecar|appimage|bundle' /tmp/tauri-build.log | tail -n 80 || true
-            echo "::endgroup::"
-            echo "::group::Last 120 lines of Tauri build"
             tail -n 120 /tmp/tauri-build.log
-            echo "::endgroup::"
             exit "$status"
           fi
           tail -n 40 /tmp/tauri-build.log
@@ -90,21 +120,16 @@ jobs:
           )
           find "$extract_dir/squashfs-root" -maxdepth 8 \( -type f -o -type l \) -printf '%M %p\n' \
             > target/bundle-diagnostics/appimage-manifest.txt
-
-          echo "::group::deb sidecar candidates"
-          grep -Ei 'nyrva|hook|usr/bin' target/bundle-diagnostics/deb-manifest.txt || true
-          echo "::endgroup::"
-          echo "::group::AppImage sidecar candidates"
-          grep -Ei 'nyrva|hook|usr/bin' target/bundle-diagnostics/appimage-manifest.txt || true
-          echo "::endgroup::"
-      - name: Upload Linux bundle diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-bundle-diagnostics
-          path: target/bundle-diagnostics/*.txt
       - name: Verify Linux bundles and hook sidecar
         run: |
           set -euo pipefail
           grep -Eq '[[:space:]]usr/bin/nyrva-hook$' target/bundle-diagnostics/deb-manifest.txt
           grep -Eq '/usr/bin/nyrva-hook$' target/bundle-diagnostics/appimage-manifest.txt
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyrva-linux
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
