@@ -49,6 +49,12 @@ pub fn launcher_path_from(appimage: Option<&str>, current_exe: &Path) -> PathBuf
         .unwrap_or_else(|| current_exe.to_path_buf())
 }
 
+fn config_for_persistence(cfg: &Config, appimage: Option<&str>, current_exe: &Path) -> Config {
+    let mut persisted = cfg.clone();
+    persisted.launcher_path = launcher_path_from(appimage, current_exe).to_string_lossy().into_owned();
+    persisted
+}
+
 pub fn config_path() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("nyrva").join("config.json")
 }
@@ -61,12 +67,19 @@ pub fn load() -> Config {
 pub fn save(cfg: &Config) {
     let path = config_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    if let Ok(txt) = serde_json::to_string_pretty(cfg) { let _ = std::fs::write(path, txt); }
+    let persisted = std::env::current_exe()
+        .ok()
+        .map(|current_exe| {
+            let appimage = std::env::var("APPIMAGE").ok();
+            config_for_persistence(cfg, appimage.as_deref(), &current_exe)
+        })
+        .unwrap_or_else(|| cfg.clone());
+    if let Ok(txt) = serde_json::to_string_pretty(&persisted) { let _ = std::fs::write(path, txt); }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::launcher_path_from;
+    use super::{config_for_persistence, launcher_path_from, Config};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -82,5 +95,25 @@ mod tests {
     fn launcher_falls_back_to_current_executable() {
         let current = Path::new("/usr/bin/nyrva");
         assert_eq!(launcher_path_from(None, current), PathBuf::from("/usr/bin/nyrva"));
+    }
+
+    #[test]
+    fn persistence_overrides_stale_launcher_with_current_appimage() {
+        let mut cfg = Config::default();
+        cfg.launcher_path = "/old/location/Nyrva.AppImage".into();
+        let persisted = config_for_persistence(
+            &cfg,
+            Some("/home/alice/Apps/Nyrva.AppImage"),
+            Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva"),
+        );
+        assert_eq!(persisted.launcher_path, "/home/alice/Apps/Nyrva.AppImage");
+        assert_eq!(cfg.launcher_path, "/old/location/Nyrva.AppImage");
+    }
+
+    #[test]
+    fn persistence_uses_installed_binary_for_deb() {
+        let cfg = Config::default();
+        let persisted = config_for_persistence(&cfg, None, Path::new("/usr/bin/nyrva"));
+        assert_eq!(persisted.launcher_path, "/usr/bin/nyrva");
     }
 }
