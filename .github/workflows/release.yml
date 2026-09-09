@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tagged application version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Require matching tag, Cargo and Tauri versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: python scripts/release_tools.py validate-tag --ref-type "$REF_TYPE" --tag "$RELEASE_TAG"
+
+  build:
+    name: Build and verify tagged packages
+    needs: validate
+    # Local reusable workflows come from the same commit as the caller.
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Attach verified packages to a draft release
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nyrva-*
+          merge-multiple: true
+          path: artifacts
+      - name: Require all package formats and generate checksums
+        run: python scripts/release_tools.py prepare-assets --source artifacts --output dist
+      - name: Create draft without publishing or replacing an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --draft \
+            --title "Nyrva $RELEASE_TAG" \
+            --generate-notes \
+            --notes "Built from commit $GITHUB_SHA. Desktop smoke acceptance is required before publication; see docs/SMOKE_TESTS.md and docs/RELEASING.md. Artifacts are unsigned. SHA256SUMS verifies file integrity, not publisher identity."
