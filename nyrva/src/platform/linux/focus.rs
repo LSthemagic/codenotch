@@ -52,6 +52,31 @@ fn window_pid<C: Connection>(conn: &C, window: Window, pid_atom: Atom) -> Option
     values.next()
 }
 
+fn prefer_managed_windows(managed: Option<Vec<Window>>, fallback: Vec<Window>) -> Vec<Window> {
+    match managed {
+        Some(windows) if !windows.is_empty() => windows,
+        _ => fallback,
+    }
+}
+
+fn client_windows<C: Connection>(conn: &C, root: Window) -> Vec<Window> {
+    let managed = intern_atom(conn, b"_NET_CLIENT_LIST").and_then(|client_list_atom| {
+        let reply = conn
+            .get_property(false, root, client_list_atom, AtomEnum::WINDOW, 0, 4096)
+            .ok()?
+            .reply()
+            .ok()?;
+        Some(reply.value32()?.collect::<Vec<_>>())
+    });
+    let fallback = conn
+        .query_tree(root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|tree| tree.children)
+        .unwrap_or_default();
+    prefer_managed_windows(managed, fallback)
+}
+
 pub fn fg_pid() -> u32 {
     let Ok((conn, screen_num)) = x11rb::connect(None) else { return 0; };
     let Some(screen) = conn.setup().roots.get(screen_num) else { return 0; };
@@ -111,12 +136,9 @@ pub fn focus_terminal(pid: u32) -> bool {
     let Some(screen) = conn.setup().roots.get(screen_num) else { return false; };
     let Some(pid_atom) = intern_atom(&conn, b"_NET_WM_PID") else { return false; };
     let Some(active_atom) = intern_atom(&conn, b"_NET_ACTIVE_WINDOW") else { return false; };
-    let Ok(tree_cookie) = conn.query_tree(screen.root) else { return false; };
-    let Ok(tree) = tree_cookie.reply() else { return false; };
-    let windows: Vec<(Window, u32)> = tree
-        .children
-        .iter()
-        .filter_map(|&window| window_pid(&conn, window, pid_atom).map(|pid| (window, pid)))
+    let windows: Vec<(Window, u32)> = client_windows(&conn, screen.root)
+        .into_iter()
+        .filter_map(|window| window_pid(&conn, window, pid_atom).map(|pid| (window, pid)))
         .collect();
     let Some(window) = best_window_for_chain(&windows, &chain, &maps) else { return false; };
 
@@ -148,7 +170,7 @@ pub fn focus_claude_desktop() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_window_for_chain, chain_of, parse_proc_stat, pid_hits_chain, ProcMaps};
+    use super::{best_window_for_chain, chain_of, parse_proc_stat, pid_hits_chain, prefer_managed_windows, ProcMaps};
     use std::collections::HashMap;
 
     #[test]
@@ -182,6 +204,16 @@ mod tests {
             parse_proc_stat(stat),
             Some((4242, 4000, "claude worker".to_string()))
         );
+    }
+
+    #[test]
+    fn managed_window_list_is_preferred_over_root_tree_frames() {
+        assert_eq!(
+            prefer_managed_windows(Some(vec![101, 102]), vec![9001, 9002]),
+            vec![101, 102]
+        );
+        assert_eq!(prefer_managed_windows(Some(vec![]), vec![9001]), vec![9001]);
+        assert_eq!(prefer_managed_windows(None, vec![9002]), vec![9002]);
     }
 
     #[test]
