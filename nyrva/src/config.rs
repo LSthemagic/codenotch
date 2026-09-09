@@ -43,3 +43,24 @@ pub fn save(cfg: &Config) {
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
     if let Ok(txt) = serde_json::to_string_pretty(cfg) { let _ = std::fs::write(path, txt); }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::launcher_path_from;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn linux_launcher_prefers_outer_appimage_path() {
+        let current = Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva");
+        assert_eq!(
+            launcher_path_from(Some("/home/alice/Apps/Nyrva.AppImage"), current),
+            PathBuf::from("/home/alice/Apps/Nyrva.AppImage")
+        );
+    }
+
+    #[test]
+    fn launcher_falls_back_to_current_executable() {
+        let current = Path::new("/usr/bin/nyrva");
+        assert_eq!(launcher_path_from(None, current), PathBuf::from("/usr/bin/nyrva"));
+    }
+}
