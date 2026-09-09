@@ -14,6 +14,10 @@ const WIRING: &[(&str, bool, &str)] = &[
     ("SessionEnd", false, "session_end"),
 ];
 
+fn hook_binary_name() -> &'static str {
+    if cfg!(windows) { "nyrva-hook.exe" } else { "nyrva-hook" }
+}
+
 fn settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
@@ -61,7 +65,7 @@ pub fn install() -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parent()
         .ok_or("cannot locate the program directory")?
-        .join("nyrva-hook.exe");
+        .join(hook_binary_name());
     if !hook_exe.exists() {
         return Err(format!("missing {}", hook_exe.display()));
     }
