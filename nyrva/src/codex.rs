@@ -537,3 +537,25 @@ pub fn probe() -> String {
         age
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn codex_home_prefers_non_empty_env() {
+        assert_eq!(
+            codex_home_from(Some(OsStr::new("/tmp/custom")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/tmp/custom"))
+        );
+    }
+
+    #[test]
+    fn codex_home_falls_back_to_dot_codex() {
+        assert_eq!(
+            codex_home_from(Some(OsStr::new("")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.codex"))
+        );
+    }
+}
