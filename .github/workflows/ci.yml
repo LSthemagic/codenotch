@@ -106,5 +106,5 @@ jobs:
       - name: Verify Linux bundles and hook sidecar
         run: |
           set -euo pipefail
-          grep -Eq '\./usr/bin/nyrva-hook$' target/bundle-diagnostics/deb-manifest.txt
+          grep -Eq '[[:space:]]usr/bin/nyrva-hook$' target/bundle-diagnostics/deb-manifest.txt
           grep -Eq '/usr/bin/nyrva-hook$' target/bundle-diagnostics/appimage-manifest.txt
