@@ -1,3 +1,4 @@
 target/
 *.log
 codenotch/gen/
+nyrva/binaries/
