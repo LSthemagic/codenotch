@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Test release version and asset guards
-        run: python -m unittest discover -s tests -p 'test_release_tools.py' -v
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
   windows:
     name: Windows Rust workspace
@@ -61,6 +61,10 @@ jobs:
           if ($manifest -notmatch '(?i)nyrva-hook\.exe') {
             Write-Host $manifest
             throw 'NSIS installer does not contain nyrva-hook.exe'
+          }
+          foreach ($notice in @('LICENSE', 'CREDITS.md', 'PROVIDER_GLYPH_NOTICES.md')) {
+            $pattern = '(?im)(?:^|[\\/\s])' + [regex]::Escape($notice) + '\r?$'
+            if ($manifest -notmatch $pattern) { throw "NSIS installer does not contain $notice" }
           }
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
@@ -143,6 +147,14 @@ jobs:
           set -euo pipefail
           grep -Eq '[[:space:]]usr/bin/nyrva-hook$' target/bundle-diagnostics/deb-manifest.txt
           grep -Eq '/usr/bin/nyrva-hook$' target/bundle-diagnostics/appimage-manifest.txt
+          for notice in LICENSE CREDITS.md PROVIDER_GLYPH_NOTICES.md; do
+            for manifest in deb-manifest.txt appimage-manifest.txt; do
+              awk -v suffix="/$notice" '
+                length($NF) >= length(suffix) && substr($NF, length($NF)-length(suffix)+1) == suffix { found=1 }
+                END { exit !found }
+              ' "target/bundle-diagnostics/$manifest"
+            done
+          done
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:

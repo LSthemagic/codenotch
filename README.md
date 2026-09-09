@@ -2,6 +2,8 @@
 
 Nyrva is a lightweight desktop usage monitor for AI coding assistants. It pins provider usage and session activity to the edge of your screen so limits stay visible without interrupting your workflow.
 
+An independent fork of [Codenotch](https://github.com/vinzdg/codenotch), built on its existing Windows port. See [credits and provenance](CREDITS.md).
+
 ## MVP scope and release status
 
 The implemented MVP targets **Windows and Linux X11**, with **Claude Code, Codex, Cursor and Antigravity**. Windows packages use NSIS (`.exe`); Linux packages use `.deb` and AppImage. Each package includes the `nyrva-hook` helper for Claude Code.
@@ -21,7 +23,7 @@ Successful CI runs upload:
 
 For development testing, download the artifacts from the successful Actions run for the commit being tested. These are CI builds, not a declaration of a stable release.
 
-Version tags matching `v*` run the [release workflow](.github/workflows/release.yml). It validates the tag against Cargo and Tauri, reuses the same CI build/test/package gates, requires all three package formats and creates a **draft GitHub Release** with `SHA256SUMS`. A maintainer publishes it only after manual acceptance; pushing a tag does not publish a stable release automatically.
+Version tags matching `v*`, or a reviewed change to `.github/release-request.json` merged into `main`, run the [release workflow](.github/workflows/release.yml). It validates the requested version against Cargo and Tauri, reuses the same CI build/test/package gates, requires all three package formats and creates a **draft GitHub Release** with `SHA256SUMS`. For a main-branch request, it creates the matching tag at the exact built commit only after the checks pass. A maintainer publishes the draft only after manual acceptance; pushing a tag does not publish a stable release automatically.
 
 See [release instructions](docs/RELEASING.md) for versioning, acceptance, publishing and failed-run recovery. Packages are unsigned; checksums verify integrity, not publisher identity.
 
@@ -68,11 +70,13 @@ cargo test --workspace
 Release tooling tests use Python 3.11+ and only its standard library:
 
 ```bash
-python -m unittest discover -s tests -p 'test_release_tools.py' -v
+python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 Build/package commands, manual test records and publication steps are documented separately so passing a build cannot be mistaken for release acceptance. Documentation in `docs/DEVELOPMENT.md`, `docs/SMOKE_TESTS.md` and `docs/RELEASING.md` is in Portuguese.
 
 ## License and attribution
 
-Nyrva is MIT licensed and is based on MIT-licensed work from the original Codenotch project and its Windows port. Existing copyright and third-party attribution notices are preserved in `LICENSE` and provider glyph notices.
+Nyrva is MIT licensed and derives from [Codenotch](https://github.com/vinzdg/codenotch) by **Vinz (@vinzdg) and contributors**, including the existing **Rust/Tauri Windows port credited to Im-Midi (NG) and contributors**. The original concept, prior code and derived artwork remain attributed to their authors; this fork does not claim they were created from scratch here.
+
+Nyrva adds its workspace/branding, platform separation, Linux X11 adaptations and cross-platform delivery work. See [CREDITS.md](CREDITS.md) for provenance and [LICENSE](LICENSE) for the inherited copyright and permission notice. `LICENSE`, `CREDITS.md` and the provider glyph notice are included in the application packages and attached to the release.

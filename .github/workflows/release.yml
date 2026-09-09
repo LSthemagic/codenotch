@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+    branches: [main]
+    paths: ['.github/release-request.json']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,9 +16,13 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate tagged application version
+    name: Validate release identity and notes
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      create_tag: ${{ steps.identity.outputs.create_tag }}
+      notes: ${{ steps.identity.outputs.notes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,16 +31,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Require matching tag, Cargo and Tauri versions
+      - name: Require matching request or tag, Cargo and Tauri versions
+        id: identity
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
-        run: python scripts/release_tools.py validate-tag --ref-type "$REF_TYPE" --tag "$RELEASE_TAG"
+        run: |
+          set -euo pipefail
+          python scripts/release_request.py --event-name "$EVENT_NAME" \
+            --ref-type "$REF_TYPE" --ref-name "$REF_NAME" > release-identity.json
+          jq -r '"tag=" + .tag, "create_tag=" + (.create_tag|tostring), "notes=" + .notes' \
+            release-identity.json >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build and verify tagged packages
+    name: Build and verify release packages
     needs: validate
-    # Local reusable workflows come from the same commit as the caller.
+    # The local reusable workflow and its checkout use this caller's commit.
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -58,16 +72,54 @@ jobs:
           pattern: nyrva-*
           merge-multiple: true
           path: artifacts
-      - name: Require all package formats and generate checksums
-        run: python scripts/release_tools.py prepare-assets --source artifacts --output dist
-      - name: Create draft without publishing or replacing an existing release
+      - name: Require all package formats and include distribution notices
+        run: |
+          set -euo pipefail
+          python scripts/release_tools.py prepare-assets --source artifacts --output dist
+          cp LICENSE CREDITS.md dist/
+          cp nyrva/glyphs/NOTICE.md dist/PROVIDER_GLYPH_NOTICES.md
+          (cd dist && sha256sum *.exe *.deb *.AppImage LICENSE CREDITS.md PROVIDER_GLYPH_NOTICES.md > SHA256SUMS)
+      - name: Create requested tag only after builds and verify its exact commit
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          CREATE_TAG: ${{ needs.validate.outputs.create_tag }}
         run: |
+          set -euo pipefail
+          if [ "$CREATE_TAG" = true ]; then
+            refs="$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG")"
+            count="$(jq --arg ref "refs/tags/$RELEASE_TAG" '[.[] | select(.ref == $ref)] | length' <<< "$refs")"
+            if [ "$count" = 0 ]; then
+              jq -n --arg ref "refs/tags/$RELEASE_TAG" --arg sha "$GITHUB_SHA" \
+                '{ref: $ref, sha: $sha}' | gh api --method POST "repos/$GH_REPO/git/refs" --input - > /dev/null
+            fi
+          fi
+          object="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG")"
+          for depth in 1 2 3 4 5; do
+            if [ "$(jq -r '.object.type' <<< "$object")" != tag ]; then break; fi
+            sha="$(jq -r '.object.sha' <<< "$object")"
+            object="$(gh api "repos/$GH_REPO/git/tags/$sha")"
+          done
+          test "$(jq -r '.object.type' <<< "$object")" = commit
+          if [ "$(jq -r '.object.sha' <<< "$object")" != "$GITHUB_SHA" ]; then
+            echo '::error::Release tag does not point to the built commit; refusing to move or replace it.'
+            exit 1
+          fi
+          # GITHUB_TOKEN-created tags do not trigger another push workflow.
+          # This same run already built the exact commit and now creates the draft.
+      - name: Create credited draft without replacing an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_NOTES: ${{ needs.validate.outputs.notes }}
+        run: |
+          set -euo pipefail
+          cp "$RELEASE_NOTES" release-notes.md
+          printf '\n## Build provenance\n\nCommit: `%s`\n\nBuild: %s/%s/actions/runs/%s\n' \
+            "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> release-notes.md
           gh release create "$RELEASE_TAG" dist/* \
             --verify-tag --draft \
-            --title "Nyrva $RELEASE_TAG" \
-            --generate-notes \
-            --notes "Built from commit $GITHUB_SHA. Desktop smoke acceptance is required before publication; see docs/SMOKE_TESTS.md and docs/RELEASING.md. Artifacts are unsigned. SHA256SUMS verifies file integrity, not publisher identity."
+            --title "Nyrva $RELEASE_TAG — Windows & Linux X11 MVP" \
+            --notes-file release-notes.md

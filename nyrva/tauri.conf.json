@@ -23,6 +23,11 @@
     "security": { "csp": null }
   },
   "bundle": {
-    "active": true
+    "active": true,
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../CREDITS.md": "CREDITS.md",
+      "glyphs/NOTICE.md": "PROVIDER_GLYPH_NOTICES.md"
+    }
   }
 }
