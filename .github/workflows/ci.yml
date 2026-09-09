@@ -12,13 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare Windows sidecar
+        shell: pwsh
+        run: ./scripts/prepare-windows-sidecar.ps1 debug
       - name: Cargo check
         run: cargo check --workspace
       - name: Cargo test
         run: cargo test --workspace
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0" --locked
-      - name: Prepare Windows sidecar
+      - name: Prepare release sidecar
         shell: pwsh
         run: ./scripts/prepare-windows-sidecar.ps1 release
       - name: Build Windows NSIS installer
