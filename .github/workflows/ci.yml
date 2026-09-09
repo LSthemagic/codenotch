@@ -53,7 +53,21 @@ jobs:
         run: bash scripts/prepare-linux-sidecar.sh release
       - name: Build Linux bundles
         working-directory: nyrva
-        run: cargo tauri build
+        run: |
+          set +e
+          cargo tauri build > /tmp/tauri-build.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo tauri build failed with exit code $status"
+            echo "::group::Relevant Tauri build errors"
+            grep -Ei 'error|failed|externalbin|sidecar|appimage|bundle' /tmp/tauri-build.log | tail -n 80 || true
+            echo "::endgroup::"
+            echo "::group::Last 120 lines of Tauri build"
+            tail -n 120 /tmp/tauri-build.log
+            echo "::endgroup::"
+            exit "$status"
+          fi
+          tail -n 40 /tmp/tauri-build.log
       - name: Verify Linux bundles and hook sidecar
         run: |
           set -euo pipefail
