@@ -9,7 +9,7 @@
 //!     it must be opened as a plain read-only connection (immutable ignores the WAL and shows the
 //!     world as of the last checkpoint).
 //!   - Codex: the desktop app keeps turn state in `thread_turns` inside
-//!     `~/.codex/thread_history_1.sqlite` (status = inProgress with an empty completed_at = running)
+//!     `CODEX_HOME/thread_history_1.sqlite` (status = inProgress with an empty completed_at = running)
 //!     — real state. The CLI / VS Code extension fall back to classifying the last entry of the
 //!     rollout, with a silence threshold that depends on the entry type.
 //!   - Claude cloud sessions: no local transcript, so they are inferred from the desktop app's
@@ -58,7 +58,6 @@ fn mtime_ms(p: &std::path::Path) -> Option<u64> {
         .ok()
         .map(|d| d.as_millis() as u64)
 }
-
 
 /// Persistent connection + change gating: the query runs again only when the database file (or its
 /// -wal) changed mtime; otherwise the last result is reused. Cursor's state.vscdb is over 2 GB, and
@@ -114,6 +113,7 @@ struct Ctx {
     cursor: DbCache,
     codex_turns: DbCache,
     codex_names: Option<rusqlite::Connection>,
+    codex_state_path: std::path::PathBuf,
     rollout_path: Option<std::path::PathBuf>,
     rollout_checked_at: u64,
     rollout_sig: u64,
@@ -122,11 +122,17 @@ struct Ctx {
 
 impl Ctx {
     fn new() -> Self {
-        let home = dirs::home_dir().unwrap_or_default();
+        let codex_paths = crate::codex::codex_paths();
         Self {
             cursor: DbCache::new(crate::cursor::store_url().unwrap_or_default()),
-            codex_turns: DbCache::new(home.join(".codex").join("thread_history_1.sqlite")),
+            codex_turns: DbCache::new(
+                codex_paths
+                    .as_ref()
+                    .map(|paths| paths.thread_history.clone())
+                    .unwrap_or_default(),
+            ),
             codex_names: None,
+            codex_state_path: codex_paths.map(|paths| paths.state).unwrap_or_default(),
             rollout_path: None,
             rollout_checked_at: 0,
             rollout_sig: 0,
@@ -247,7 +253,7 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
     None
 }
 
-/// The desktop app's real state: table `thread_turns` in `~/.codex/thread_history_1.sqlite`
+/// The desktop app's real state: table `thread_turns` in `CODEX_HOME/thread_history_1.sqlite`
 /// (status = inProgress / completed…, started_at in seconds, empty completed_at = still running).
 /// The app maintains this turn table itself, which is far more reliable than a file mtime. Guard
 /// against "inProgress forever after a crash": no new item for the thread in the last 10 minutes
@@ -255,7 +261,7 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
 fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
     let now = now_ms();
     if ctx.codex_names.is_none() {
-        ctx.codex_names = dirs::home_dir().and_then(|h| open_ro(&h.join(".codex").join("state_5.sqlite")));
+        ctx.codex_names = open_ro(&ctx.codex_state_path);
     }
     let names = ctx.codex_names.as_ref();
     ctx.codex_turns.refresh(|conn| {
