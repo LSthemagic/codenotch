@@ -4,26 +4,39 @@ Nyrva is a lightweight desktop usage monitor for AI coding assistants. It pins p
 
 ## Providers
 
-The first Nyrva release keeps the four providers from the existing Windows port:
+The MVP supports the same four providers on the supported desktop platforms:
 
 - Claude Code
 - Codex
 - Cursor
 - Antigravity
 
+Provider-owned credentials and state are read-only from Nyrva's point of view.
+
 ## Platforms
 
 ### Windows
 
-Windows is the current working baseline and the focus of the foundation milestone.
+Windows is supported and distributed as an NSIS installer. The installer includes the `nyrva-hook` helper used by the Claude Code integration.
 
 ### Linux
 
-Linux support is planned next, starting with X11. Wayland support is intentionally deferred because edge-pinned global window positioning requires compositor-specific work.
+Linux X11 is supported. Ubuntu 22.04 and Debian 12 are the MVP baseline. Builds are distributed as both `.deb` and AppImage packages, including the `nyrva-hook` helper.
+
+Wayland is intentionally deferred because reliable global edge positioning and focus behavior are compositor-specific.
+
+## Installable builds
+
+Every successful `main` CI run publishes downloadable artifacts:
+
+- `nyrva-windows` — Windows NSIS installer (`.exe`)
+- `nyrva-linux` — Debian package (`.deb`) and AppImage
+
+Open the latest successful GitHub Actions **CI** run and download the artifact for your platform.
 
 ## Architecture
 
-Nyrva is built with Rust and Tauri 2. The UI remains the compact edge-notch interface from the existing Windows port for the first release.
+Nyrva is built with Rust and Tauri 2. The UI remains the compact edge-notch interface from the existing Windows port for the MVP.
 
 ```text
 Cargo.toml
@@ -31,33 +44,53 @@ Cargo.toml
 └── nyrva-hook/  # Claude Code hook launcher
 ```
 
-Provider logic lives in the desktop crate and currently supports Claude, Codex, Cursor, and Antigravity.
+OS-specific behavior is isolated behind the platform layer, while provider adapters live in the desktop crate.
 
 ## Development
 
-Requirements for the current Windows build include Rust and the normal Tauri 2 Windows prerequisites/WebView2 environment.
-
 From the repository root:
 
-```powershell
+```bash
 cargo check --workspace
 cargo test --workspace
-cargo run -p nyrva
 ```
 
-Release build:
+### Windows package
+
+With the normal Tauri 2 Windows prerequisites/WebView2 environment installed:
 
 ```powershell
-cargo build --workspace --release
+cargo install tauri-cli --version "^2.0.0" --locked
+./scripts/prepare-windows-sidecar.ps1 release
+cd nyrva
+cargo tauri build
 ```
 
-## Roadmap
+### Linux X11 packages
 
-1. Nyrva foundation and Windows baseline
-2. Platform abstraction for OS-specific behavior
-3. Linux X11 support
-4. Linux provider/activity parity
-5. Wayland support
+Install the normal Tauri 2 Linux prerequisites for your distribution, then:
+
+```bash
+cargo install tauri-cli --version '^2.0.0' --locked
+bash scripts/prepare-linux-sidecar.sh release
+cd nyrva
+cargo tauri build
+```
+
+The Linux Tauri config generates both `.deb` and AppImage packages.
+
+## MVP status
+
+- Nyrva foundation ✅
+- Cross-platform OS boundary ✅
+- Linux X11 foundation ✅
+- Claude Code Linux parity ✅
+- Codex Linux parity ✅
+- Cursor Linux parity ✅
+- Antigravity Linux parity ✅
+- Windows/Linux packaging and downloadable CI artifacts ✅
+
+Wayland remains post-MVP work.
 
 ## License and attribution
 
