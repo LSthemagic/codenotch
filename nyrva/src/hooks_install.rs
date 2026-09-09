@@ -2,7 +2,7 @@
 //! Identification accepts both Nyrva and legacy Codenotch hook commands so upgrades can cleanly replace older entries.
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const WIRING: &[(&str, bool, &str)] = &[
     ("SessionStart", false, "session_start"),
@@ -16,6 +16,34 @@ const WIRING: &[(&str, bool, &str)] = &[
 
 fn hook_binary_name() -> &'static str {
     if cfg!(windows) { "nyrva-hook.exe" } else { "nyrva-hook" }
+}
+
+fn bundled_hook_path(main_exe: &Path) -> PathBuf {
+    main_exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(hook_binary_name())
+}
+
+fn persistent_hook_path_from(data_dir: &Path) -> PathBuf {
+    data_dir.join("nyrva").join("bin").join(hook_binary_name())
+}
+
+fn hook_command(path: &Path, internal: &str) -> String {
+    format!("\"{}\" {internal}", path.display())
+}
+
+#[cfg(target_os = "linux")]
+fn install_hook_binary_to(source: &Path, destination: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = destination.parent().ok_or("invalid persistent hook destination")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    std::fs::copy(source, destination).map_err(|e| e.to_string())?;
+    let mut permissions = std::fs::metadata(destination).map_err(|e| e.to_string())?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(destination, permissions).map_err(|e| e.to_string())?;
+    Ok(destination.to_path_buf())
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -61,14 +89,20 @@ pub fn is_installed() -> bool {
 
 pub fn install() -> Result<String, String> {
     let path = settings_path().ok_or("cannot find the user directory")?;
-    let hook_exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("cannot locate the program directory")?
-        .join(hook_binary_name());
-    if !hook_exe.exists() {
-        return Err(format!("missing {}", hook_exe.display()));
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bundled = bundled_hook_path(&current_exe);
+    if !bundled.exists() {
+        return Err(format!("missing {}", bundled.display()));
     }
+
+    #[cfg(target_os = "linux")]
+    let hook_exe = {
+        let data_dir = dirs::data_local_dir().ok_or("cannot find the user data directory")?;
+        let destination = persistent_hook_path_from(&data_dir);
+        install_hook_binary_to(&bundled, &destination)?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let hook_exe = bundled;
 
     let mut root = load(&path);
     if !root.is_object() { root = json!({}); }
@@ -77,7 +111,7 @@ pub fn install() -> Result<String, String> {
     for (event, need_matcher, internal) in WIRING {
         let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
         let mut arr: Vec<Value> = arr.into_iter().filter(|e| !is_ours(e)).collect();
-        let cmd = format!("\"{}\" {}", hook_exe.display(), internal);
+        let cmd = hook_command(&hook_exe, internal);
         let mut entry = json!({ "hooks": [{ "type": "command", "command": cmd, "timeout": 5 }] });
         if *need_matcher { entry["matcher"] = json!("*"); }
         arr.push(entry);
@@ -85,7 +119,7 @@ pub fn install() -> Result<String, String> {
     }
 
     backup_and_write(&path, &root)?;
-    Ok(format!("wrote {} ({} events)", path.display(), WIRING.len()))
+    Ok(format!("wrote {} ({} events; hook {})", path.display(), WIRING.len(), hook_exe.display()))
 }
 
 pub fn uninstall() -> Result<String, String> {
@@ -102,6 +136,15 @@ pub fn uninstall() -> Result<String, String> {
         }
     }
     backup_and_write(&path, &root)?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(data_dir) = dirs::data_local_dir() {
+        let helper = persistent_hook_path_from(&data_dir);
+        if helper.exists() {
+            let _ = std::fs::remove_file(helper);
+        }
+    }
+
     Ok(format!("removed {removed} Nyrva hook(s)"))
 }
 
