@@ -107,7 +107,8 @@ pub fn uninstall() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::hook_binary_name;
+    use super::{bundled_hook_path, hook_binary_name, hook_command, persistent_hook_path_from};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn hook_binary_name_matches_platform() {
@@ -115,5 +116,26 @@ mod tests {
         assert_eq!(hook_binary_name(), "nyrva-hook.exe");
         #[cfg(target_os = "linux")]
         assert_eq!(hook_binary_name(), "nyrva-hook");
+    }
+
+    #[test]
+    fn bundled_hook_is_next_to_main_executable() {
+        let exe = Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva");
+        assert_eq!(bundled_hook_path(exe), PathBuf::from("/tmp/.mount_Nyrva/usr/bin/nyrva-hook"));
+    }
+
+    #[test]
+    fn persistent_linux_hook_lives_under_user_data_dir() {
+        let base = Path::new("/home/alice/.local/share");
+        assert_eq!(
+            persistent_hook_path_from(base),
+            PathBuf::from("/home/alice/.local/share/nyrva/bin/nyrva-hook")
+        );
+    }
+
+    #[test]
+    fn hook_command_quotes_paths_with_spaces() {
+        let path = Path::new("/home/alice/Nyrva Data/bin/nyrva-hook");
+        assert_eq!(hook_command(path, "running"), "\"/home/alice/Nyrva Data/bin/nyrva-hook\" running");
     }
 }
