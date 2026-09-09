@@ -95,6 +95,14 @@ pub fn install() -> Result<String, String> {
         return Err(format!("missing {}", bundled.display()));
     }
 
+    // The persistent helper may outlive an AppImage mount. Record the executable that can
+    // actually relaunch Nyrva: the outer APPIMAGE path when present, otherwise current_exe.
+    let appimage = std::env::var("APPIMAGE").ok();
+    let launch_target = crate::config::launcher_path_from(appimage.as_deref(), &current_exe);
+    let mut cfg = crate::config::load();
+    cfg.launcher_path = launch_target.to_string_lossy().into_owned();
+    crate::config::save(&cfg);
+
     #[cfg(target_os = "linux")]
     let hook_exe = {
         let data_dir = dirs::data_local_dir().ok_or("cannot find the user data directory")?;
@@ -150,10 +158,12 @@ pub fn uninstall() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bundled_hook_path, hook_binary_name, hook_command, persistent_hook_path_from};
+    use super::{hook_binary_name, hook_command};
     #[cfg(target_os = "linux")]
-    use super::install_hook_binary_to;
-    use std::path::{Path, PathBuf};
+    use super::{bundled_hook_path, install_hook_binary_to, persistent_hook_path_from};
+    use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
 
     #[test]
     fn hook_binary_name_matches_platform() {
@@ -163,12 +173,14 @@ mod tests {
         assert_eq!(hook_binary_name(), "nyrva-hook");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bundled_hook_is_next_to_main_executable() {
         let exe = Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva");
         assert_eq!(bundled_hook_path(exe), PathBuf::from("/tmp/.mount_Nyrva/usr/bin/nyrva-hook"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn persistent_linux_hook_lives_under_user_data_dir() {
         let base = Path::new("/home/alice/.local/share");
