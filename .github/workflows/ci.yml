@@ -78,9 +78,11 @@ jobs:
           echo "deb=$deb"
           echo "appimage=$appimage"
 
+          dpkg-deb -c "$deb" > /tmp/deb-manifest.txt
           echo "::group::deb Nyrva entries"
-          dpkg-deb -c "$deb" | grep -Ei 'nyrva|hook|usr/bin' || true
+          grep -Ei 'nyrva|hook|usr/bin' /tmp/deb-manifest.txt || true
           echo "::endgroup::"
+          grep -Eq '\./usr/bin/nyrva-hook$' /tmp/deb-manifest.txt
 
           appimage="$(realpath "$appimage")"
           chmod +x "$appimage"
@@ -92,6 +94,4 @@ jobs:
           echo "::group::AppImage Nyrva entries"
           find "$extract_dir/squashfs-root" -maxdepth 6 \( -type f -o -type l \) -print | grep -Ei 'nyrva|hook|usr/bin' || true
           echo "::endgroup::"
-
-          dpkg-deb -c "$deb" | grep -Eq '\./usr/bin/nyrva-hook$'
           test -x "$extract_dir/squashfs-root/usr/bin/nyrva-hook"
