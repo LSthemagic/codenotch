@@ -42,6 +42,59 @@ fn read_port() -> u16 {
     DEFAULT_PORT
 }
 
+fn parse_json_string_field(txt: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\"");
+    let start = txt.find(&marker)? + marker.len();
+    let after_colon = txt[start..].find(':')? + start + 1;
+    let bytes = txt.as_bytes();
+    let mut i = after_colon;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    if bytes.get(i) != Some(&b'"') { return None; }
+    i += 1;
+    let mut out = String::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(out),
+            b'\\' => {
+                i += 1;
+                let escaped = *bytes.get(i)?;
+                match escaped {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000C}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    _ => return None,
+                }
+            }
+            b if b.is_ascii() => out.push(b as char),
+            _ => {
+                let rest = &txt[i..];
+                let ch = rest.chars().next()?;
+                out.push(ch);
+                i += ch.len_utf8() - 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn launch_target_from_json(txt: &str) -> Option<PathBuf> {
+    parse_json_string_field(txt, "launcher_path")
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn persisted_launch_target() -> Option<PathBuf> {
+    let path = config_path()?;
+    let txt = std::fs::read_to_string(path).ok()?;
+    launch_target_from_json(&txt)
+}
+
 fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
@@ -55,9 +108,11 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
 }
 
 fn spawn_main() {
-    let Ok(me) = std::env::current_exe() else { return };
-    let Some(dir) = me.parent() else { return };
-    let exe = dir.join(main_binary_name());
+    let exe = persisted_launch_target().or_else(|| {
+        let me = std::env::current_exe().ok()?;
+        Some(me.parent()?.join(main_binary_name()))
+    });
+    let Some(exe) = exe else { return; };
     if !exe.exists() { return; }
     let mut cmd = std::process::Command::new(exe);
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -87,8 +142,8 @@ fn parent_pid() -> u32 { std::os::unix::process::parent_id() }
 
 #[cfg(test)]
 mod tests {
-    use super::{config_path, main_binary_name};
-    use std::path::Path;
+    use super::{config_path, launch_target_from_json, main_binary_name};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn main_binary_name_matches_platform() {
@@ -102,5 +157,19 @@ mod tests {
     fn config_path_uses_nyrva_config_namespace() {
         let path = config_path().expect("config directory should be available in supported desktop environments");
         assert!(path.ends_with(Path::new("nyrva").join("config.json")));
+    }
+
+    #[test]
+    fn persisted_launcher_path_is_read_from_config_json() {
+        let json = r#"{"port":48666,"launcher_path":"/home/alice/Apps/Nyrva.AppImage"}"#;
+        assert_eq!(
+            launch_target_from_json(json),
+            Some(PathBuf::from("/home/alice/Apps/Nyrva.AppImage"))
+        );
+    }
+
+    #[test]
+    fn missing_launcher_path_returns_none() {
+        assert_eq!(launch_target_from_json(r#"{"port":48666}"#), None);
     }
 }

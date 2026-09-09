@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -17,6 +17,10 @@ pub struct Config {
     pub drag_enabled: bool,
     #[serde(default = "default_notch_y")]
     pub notch_y: f64,
+    /// Executable the persistent hook should launch when Nyrva is not running.
+    /// On AppImage this is the outer AppImage path, never the temporary /tmp/.mount_* path.
+    #[serde(default)]
+    pub launcher_path: String,
 }
 
 fn default_notch_y() -> f64 { 0.5 }
@@ -25,8 +29,30 @@ fn default_lang() -> String { "auto".into() }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { port: default_port(), lang: default_lang(), bar_x: None, bar_y: None, bar_w: None, drag_enabled: false, notch_y: default_notch_y() }
+        Self {
+            port: default_port(),
+            lang: default_lang(),
+            bar_x: None,
+            bar_y: None,
+            bar_w: None,
+            drag_enabled: false,
+            notch_y: default_notch_y(),
+            launcher_path: String::new(),
+        }
     }
+}
+
+pub fn launcher_path_from(appimage: Option<&str>, current_exe: &Path) -> PathBuf {
+    appimage
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_exe.to_path_buf())
+}
+
+fn config_for_persistence(cfg: &Config, appimage: Option<&str>, current_exe: &Path) -> Config {
+    let mut persisted = cfg.clone();
+    persisted.launcher_path = launcher_path_from(appimage, current_exe).to_string_lossy().into_owned();
+    persisted
 }
 
 pub fn config_path() -> PathBuf {
@@ -41,5 +67,53 @@ pub fn load() -> Config {
 pub fn save(cfg: &Config) {
     let path = config_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    if let Ok(txt) = serde_json::to_string_pretty(cfg) { let _ = std::fs::write(path, txt); }
+    let persisted = std::env::current_exe()
+        .ok()
+        .map(|current_exe| {
+            let appimage = std::env::var("APPIMAGE").ok();
+            config_for_persistence(cfg, appimage.as_deref(), &current_exe)
+        })
+        .unwrap_or_else(|| cfg.clone());
+    if let Ok(txt) = serde_json::to_string_pretty(&persisted) { let _ = std::fs::write(path, txt); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config_for_persistence, launcher_path_from, Config};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn linux_launcher_prefers_outer_appimage_path() {
+        let current = Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva");
+        assert_eq!(
+            launcher_path_from(Some("/home/alice/Apps/Nyrva.AppImage"), current),
+            PathBuf::from("/home/alice/Apps/Nyrva.AppImage")
+        );
+    }
+
+    #[test]
+    fn launcher_falls_back_to_current_executable() {
+        let current = Path::new("/usr/bin/nyrva");
+        assert_eq!(launcher_path_from(None, current), PathBuf::from("/usr/bin/nyrva"));
+    }
+
+    #[test]
+    fn persistence_overrides_stale_launcher_with_current_appimage() {
+        let mut cfg = Config::default();
+        cfg.launcher_path = "/old/location/Nyrva.AppImage".into();
+        let persisted = config_for_persistence(
+            &cfg,
+            Some("/home/alice/Apps/Nyrva.AppImage"),
+            Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva"),
+        );
+        assert_eq!(persisted.launcher_path, "/home/alice/Apps/Nyrva.AppImage");
+        assert_eq!(cfg.launcher_path, "/old/location/Nyrva.AppImage");
+    }
+
+    #[test]
+    fn persistence_uses_installed_binary_for_deb() {
+        let cfg = Config::default();
+        let persisted = config_for_persistence(&cfg, None, Path::new("/usr/bin/nyrva"));
+        assert_eq!(persisted.launcher_path, "/usr/bin/nyrva");
+    }
 }

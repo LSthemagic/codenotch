@@ -39,6 +39,8 @@ jobs:
             patchelf \
             libfuse2 \
             xdg-utils
+      - name: Prepare Linux sidecar
+        run: bash scripts/prepare-linux-sidecar.sh debug
       - name: Cargo check
         run: cargo check --workspace
       - name: Verify Cargo.lock is up to date
@@ -47,10 +49,49 @@ jobs:
         run: cargo test --workspace
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0" --locked
+      - name: Prepare release sidecar
+        run: bash scripts/prepare-linux-sidecar.sh release
       - name: Build Linux bundles
         working-directory: nyrva
-        run: cargo tauri build
-      - name: Verify Linux bundles
         run: |
-          test -n "$(find target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
-          test -n "$(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          set +e
+          cargo tauri build > /tmp/tauri-build.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo tauri build failed with exit code $status"
+            echo "::group::Relevant Tauri build errors"
+            grep -Ei 'error|failed|externalbin|sidecar|appimage|bundle' /tmp/tauri-build.log | tail -n 80 || true
+            echo "::endgroup::"
+            echo "::group::Last 120 lines of Tauri build"
+            tail -n 120 /tmp/tauri-build.log
+            echo "::endgroup::"
+            exit "$status"
+          fi
+          tail -n 40 /tmp/tauri-build.log
+      - name: Verify Linux bundles and hook sidecar
+        run: |
+          set -euo pipefail
+          deb="$(find target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          appimage="$(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          test -n "$deb"
+          test -n "$appimage"
+          echo "deb=$deb"
+          echo "appimage=$appimage"
+
+          dpkg-deb -c "$deb" > /tmp/deb-manifest.txt
+          echo "::group::deb Nyrva entries"
+          grep -Ei 'nyrva|hook|usr/bin' /tmp/deb-manifest.txt || true
+          echo "::endgroup::"
+          grep -Eq '\./usr/bin/nyrva-hook$' /tmp/deb-manifest.txt
+
+          appimage="$(realpath "$appimage")"
+          chmod +x "$appimage"
+          extract_dir="$(mktemp -d)"
+          (
+            cd "$extract_dir"
+            "$appimage" --appimage-extract >/dev/null
+          )
+          echo "::group::AppImage Nyrva entries"
+          find "$extract_dir/squashfs-root" -maxdepth 6 \( -type f -o -type l \) -print | grep -Ei 'nyrva|hook|usr/bin' || true
+          echo "::endgroup::"
+          test -x "$extract_dir/squashfs-root/usr/bin/nyrva-hook"

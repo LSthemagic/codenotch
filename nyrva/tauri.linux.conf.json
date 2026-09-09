@@ -1,6 +1,7 @@
 {
   "bundle": {
     "targets": ["deb", "appimage"],
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png"],
+    "externalBin": ["binaries/nyrva-hook"]
   }
 }

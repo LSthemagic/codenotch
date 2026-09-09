@@ -2,7 +2,7 @@
 //! Identification accepts both Nyrva and legacy Codenotch hook commands so upgrades can cleanly replace older entries.
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const WIRING: &[(&str, bool, &str)] = &[
     ("SessionStart", false, "session_start"),
@@ -16,6 +16,58 @@ const WIRING: &[(&str, bool, &str)] = &[
 
 fn hook_binary_name() -> &'static str {
     if cfg!(windows) { "nyrva-hook.exe" } else { "nyrva-hook" }
+}
+
+fn bundled_hook_path(main_exe: &Path) -> PathBuf {
+    main_exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(hook_binary_name())
+}
+
+fn persistent_hook_path_from(data_dir: &Path) -> PathBuf {
+    data_dir.join("nyrva").join("bin").join(hook_binary_name())
+}
+
+fn hook_command(path: &Path, internal: &str) -> String {
+    format!("\"{}\" {internal}", path.display())
+}
+
+#[cfg(target_os = "linux")]
+fn install_hook_binary_to(source: &Path, destination: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = destination.parent().ok_or("invalid persistent hook destination")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
+    // Never truncate the live helper in place. Copy to the same directory and atomically
+    // rename it over the destination; Linux permits replacing an executable that is running.
+    let temp = parent.join(format!(".nyrva-hook.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    if let Err(e) = std::fs::copy(source, &temp) {
+        return Err(e.to_string());
+    }
+    let result = (|| {
+        let mut permissions = std::fs::metadata(&temp).map_err(|e| e.to_string())?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&temp, permissions).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, destination).map_err(|e| e.to_string())?;
+        Ok(destination.to_path_buf())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn remove_persistent_hook_from(data_dir: &Path) -> Result<bool, String> {
+    let helper = persistent_hook_path_from(data_dir);
+    match std::fs::remove_file(helper) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -61,14 +113,28 @@ pub fn is_installed() -> bool {
 
 pub fn install() -> Result<String, String> {
     let path = settings_path().ok_or("cannot find the user directory")?;
-    let hook_exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("cannot locate the program directory")?
-        .join(hook_binary_name());
-    if !hook_exe.exists() {
-        return Err(format!("missing {}", hook_exe.display()));
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bundled = bundled_hook_path(&current_exe);
+    if !bundled.exists() {
+        return Err(format!("missing {}", bundled.display()));
     }
+
+    // The persistent helper may outlive an AppImage mount. Record the executable that can
+    // actually relaunch Nyrva: the outer APPIMAGE path when present, otherwise current_exe.
+    let appimage = std::env::var("APPIMAGE").ok();
+    let launch_target = crate::config::launcher_path_from(appimage.as_deref(), &current_exe);
+    let mut cfg = crate::config::load();
+    cfg.launcher_path = launch_target.to_string_lossy().into_owned();
+    crate::config::save(&cfg);
+
+    #[cfg(target_os = "linux")]
+    let hook_exe = {
+        let data_dir = dirs::data_local_dir().ok_or("cannot find the user data directory")?;
+        let destination = persistent_hook_path_from(&data_dir);
+        install_hook_binary_to(&bundled, &destination)?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let hook_exe = bundled;
 
     let mut root = load(&path);
     if !root.is_object() { root = json!({}); }
@@ -77,7 +143,7 @@ pub fn install() -> Result<String, String> {
     for (event, need_matcher, internal) in WIRING {
         let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
         let mut arr: Vec<Value> = arr.into_iter().filter(|e| !is_ours(e)).collect();
-        let cmd = format!("\"{}\" {}", hook_exe.display(), internal);
+        let cmd = hook_command(&hook_exe, internal);
         let mut entry = json!({ "hooks": [{ "type": "command", "command": cmd, "timeout": 5 }] });
         if *need_matcher { entry["matcher"] = json!("*"); }
         arr.push(entry);
@@ -85,29 +151,54 @@ pub fn install() -> Result<String, String> {
     }
 
     backup_and_write(&path, &root)?;
-    Ok(format!("wrote {} ({} events)", path.display(), WIRING.len()))
+    Ok(format!("wrote {} ({} events; hook {})", path.display(), WIRING.len(), hook_exe.display()))
 }
 
 pub fn uninstall() -> Result<String, String> {
     let path = settings_path().ok_or("cannot find the user directory")?;
-    if !path.exists() { return Ok("settings.json does not exist, nothing to uninstall".into()); }
-    let mut root = load(&path);
-    let Some(hooks) = root["hooks"].as_object_mut() else { return Ok("no hooks configuration found".into()); };
-    let mut removed = 0;
-    for (_, v) in hooks.iter_mut() {
-        if let Some(arr) = v.as_array() {
-            let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
-            removed += arr.len() - filtered.len();
-            *v = json!(filtered);
+    let settings_result = if !path.exists() {
+        "settings.json does not exist, nothing to uninstall".to_string()
+    } else {
+        let mut root = load(&path);
+        if let Some(hooks) = root["hooks"].as_object_mut() {
+            let mut removed = 0;
+            for (_, v) in hooks.iter_mut() {
+                if let Some(arr) = v.as_array() {
+                    let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
+                    removed += arr.len() - filtered.len();
+                    *v = json!(filtered);
+                }
+            }
+            backup_and_write(&path, &root)?;
+            format!("removed {removed} Nyrva hook(s)")
+        } else {
+            "no hooks configuration found".to_string()
         }
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let helper_removed = match dirs::data_local_dir() {
+            Some(data_dir) => remove_persistent_hook_from(&data_dir)?,
+            None => false,
+        };
+        return Ok(format!(
+            "{settings_result}; persistent helper {}",
+            if helper_removed { "removed" } else { "not present" }
+        ));
     }
-    backup_and_write(&path, &root)?;
-    Ok(format!("removed {removed} Nyrva hook(s)"))
+    #[cfg(not(target_os = "linux"))]
+    Ok(settings_result)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::hook_binary_name;
+    use super::{hook_binary_name, hook_command};
+    #[cfg(target_os = "linux")]
+    use super::{bundled_hook_path, install_hook_binary_to, persistent_hook_path_from, remove_persistent_hook_from};
+    use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
 
     #[test]
     fn hook_binary_name_matches_platform() {
@@ -115,5 +206,81 @@ mod tests {
         assert_eq!(hook_binary_name(), "nyrva-hook.exe");
         #[cfg(target_os = "linux")]
         assert_eq!(hook_binary_name(), "nyrva-hook");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bundled_hook_is_next_to_main_executable() {
+        let exe = Path::new("/tmp/.mount_Nyrva/usr/bin/nyrva");
+        assert_eq!(bundled_hook_path(exe), PathBuf::from("/tmp/.mount_Nyrva/usr/bin/nyrva-hook"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_linux_hook_lives_under_user_data_dir() {
+        let base = Path::new("/home/alice/.local/share");
+        assert_eq!(
+            persistent_hook_path_from(base),
+            PathBuf::from("/home/alice/.local/share/nyrva/bin/nyrva-hook")
+        );
+    }
+
+    #[test]
+    fn hook_command_quotes_paths_with_spaces() {
+        let path = Path::new("/home/alice/Nyrva Data/bin/nyrva-hook");
+        assert_eq!(hook_command(path, "running"), "\"/home/alice/Nyrva Data/bin/nyrva-hook\" running");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_hook_copy_is_executable_and_replaceable() {
+        use std::os::unix::fs::PermissionsExt;
+        let unique = format!(
+            "nyrva-hook-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source = root.join("source-hook");
+        let destination = root.join("data/nyrva/bin/nyrva-hook");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"hook-v1").unwrap();
+
+        let installed = install_hook_binary_to(&source, &destination).unwrap();
+        assert_eq!(installed, destination);
+        assert_eq!(std::fs::read(&installed).unwrap(), b"hook-v1");
+        assert_ne!(std::fs::metadata(&installed).unwrap().permissions().mode() & 0o111, 0);
+
+        std::fs::write(&source, b"hook-v2").unwrap();
+        install_hook_binary_to(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"hook-v2");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_hook_removal_is_idempotent() {
+        let unique = format!(
+            "nyrva-hook-remove-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let data_dir = std::env::temp_dir().join(unique);
+        let helper = persistent_hook_path_from(&data_dir);
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(&helper, b"hook").unwrap();
+
+        assert!(remove_persistent_hook_from(&data_dir).unwrap());
+        assert!(!helper.exists());
+        assert!(!remove_persistent_hook_from(&data_dir).unwrap());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
