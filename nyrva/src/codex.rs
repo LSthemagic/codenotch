@@ -566,4 +566,34 @@ mod tests {
             Some(PathBuf::from("/home/me/.codex"))
         );
     }
+
+    #[test]
+    fn codex_paths_share_resolved_root() {
+        let paths = codex_paths_from(Path::new("/tmp/custom"));
+        assert_eq!(paths.auth, PathBuf::from("/tmp/custom/auth.json"));
+        assert_eq!(paths.sessions, PathBuf::from("/tmp/custom/sessions"));
+        assert_eq!(paths.thread_history, PathBuf::from("/tmp/custom/thread_history_1.sqlite"));
+        assert_eq!(paths.state, PathBuf::from("/tmp/custom/state_5.sqlite"));
+        assert_eq!(paths.bin, PathBuf::from("/tmp/custom/bin"));
+    }
+
+    #[test]
+    fn linux_executable_candidates_include_codex_home_and_path() {
+        let paths = codex_paths_from(Path::new("/home/me/.codex"));
+        let candidates = executable_candidates(
+            Some(&paths),
+            &[PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")],
+            false,
+        );
+        assert_eq!(candidates[0], PathBuf::from("/home/me/.codex/bin/codex"));
+        assert!(candidates.contains(&PathBuf::from("/usr/local/bin/codex")));
+        assert!(!candidates.iter().any(|p| p.to_string_lossy().ends_with("codex.cmd")));
+    }
+
+    #[test]
+    fn user_agent_reports_linux_without_claiming_windows() {
+        let ua = user_agent_for("linux");
+        assert_eq!(ua, format!("nyrva/{} (linux)", env!("CARGO_PKG_VERSION")));
+        assert!(!ua.contains("Windows"));
+    }
 }
