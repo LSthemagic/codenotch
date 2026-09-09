@@ -1,0 +1,6 @@
+{
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "icon": ["icons/icon.png"]
+  }
+}

@@ -4,10 +4,19 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 48666;
 const MAX_STDIN: u64 = 256 * 1024;
+
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("nyrva").join("config.json"))
+}
+
+fn main_binary_name() -> &'static str {
+    if cfg!(windows) { "nyrva.exe" } else { "nyrva" }
+}
 
 fn main() {
     let event = std::env::args().nth(1).unwrap_or_else(|| "ping".into());
@@ -24,10 +33,7 @@ fn main() {
 }
 
 fn read_port() -> u16 {
-    let path = match std::env::var("APPDATA") {
-        Ok(a) => format!("{a}\\nyrva\\config.json"),
-        Err(_) => return DEFAULT_PORT,
-    };
+    let Some(path) = config_path() else { return DEFAULT_PORT; };
     let Ok(txt) = std::fs::read_to_string(path) else { return DEFAULT_PORT; };
     if let Some(i) = txt.find("\"port\"") {
         let digits: String = txt[i + 6..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
@@ -51,7 +57,7 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
 fn spawn_main() {
     let Ok(me) = std::env::current_exe() else { return };
     let Some(dir) = me.parent() else { return };
-    let exe = dir.join("nyrva.exe");
+    let exe = dir.join(main_binary_name());
     if !exe.exists() { return; }
     let mut cmd = std::process::Command::new(exe);
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -78,3 +84,23 @@ fn parent_pid() -> u32 {
 
 #[cfg(not(windows))]
 fn parent_pid() -> u32 { std::os::unix::process::parent_id() }
+
+#[cfg(test)]
+mod tests {
+    use super::{config_path, main_binary_name};
+    use std::path::Path;
+
+    #[test]
+    fn main_binary_name_matches_platform() {
+        #[cfg(windows)]
+        assert_eq!(main_binary_name(), "nyrva.exe");
+        #[cfg(target_os = "linux")]
+        assert_eq!(main_binary_name(), "nyrva");
+    }
+
+    #[test]
+    fn config_path_uses_nyrva_config_namespace() {
+        let path = config_path().expect("config directory should be available in supported desktop environments");
+        assert!(path.ends_with(Path::new("nyrva").join("config.json")));
+    }
+}

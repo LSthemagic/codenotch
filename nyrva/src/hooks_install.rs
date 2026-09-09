@@ -1,4 +1,4 @@
-//! Merges nyrva-hook.exe into ~/.claude/settings.json without overwriting the user's own hooks.
+//! Merges the Nyrva hook into ~/.claude/settings.json without overwriting the user's own hooks.
 //! Identification accepts both Nyrva and legacy Codenotch hook commands so upgrades can cleanly replace older entries.
 
 use serde_json::{json, Value};
@@ -13,6 +13,10 @@ const WIRING: &[(&str, bool, &str)] = &[
     ("Stop", false, "done"),
     ("SessionEnd", false, "session_end"),
 ];
+
+fn hook_binary_name() -> &'static str {
+    if cfg!(windows) { "nyrva-hook.exe" } else { "nyrva-hook" }
+}
 
 fn settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
@@ -61,7 +65,7 @@ pub fn install() -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parent()
         .ok_or("cannot locate the program directory")?
-        .join("nyrva-hook.exe");
+        .join(hook_binary_name());
     if !hook_exe.exists() {
         return Err(format!("missing {}", hook_exe.display()));
     }
@@ -99,4 +103,17 @@ pub fn uninstall() -> Result<String, String> {
     }
     backup_and_write(&path, &root)?;
     Ok(format!("removed {removed} Nyrva hook(s)"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hook_binary_name;
+
+    #[test]
+    fn hook_binary_name_matches_platform() {
+        #[cfg(windows)]
+        assert_eq!(hook_binary_name(), "nyrva-hook.exe");
+        #[cfg(target_os = "linux")]
+        assert_eq!(hook_binary_name(), "nyrva-hook");
+    }
 }
