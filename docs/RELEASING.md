@@ -2,30 +2,48 @@
 
 ## O que a automação faz
 
-`.github/workflows/release.yml` responde a tags `v*`, valida a identidade da versão e chama o próprio `ci.yml` por `workflow_call`. O build usa o commit do evento/tag; não troca para a `main` mais recente.
+`.github/workflows/release.yml` aceita uma tag `v*` ou uma alteração revisada em `.github/release-request.json` integrada à `main`. Também permite reexecução manual selecionando uma tag existente. Um disparo manual sobre uma branch é recusado.
 
-A publicação exige sucesso de todos os jobs reutilizados: testes das ferramentas de release, Windows e Linux. Os jobs de plataforma compilam/testam e verificam o helper nos pacotes. Em seguida, `release_tools.py` exige exatamente um `.exe`, um `.deb` e um `.AppImage`, rejeita arquivos vazios ou nomes inseguros, prepara uma pasta limpa e gera `SHA256SUMS`.
+Nos dois caminhos, o build usa o SHA exato do evento e chama o próprio `ci.yml` por `workflow_call`; não troca para uma `main` mais recente. Os testes das ferramentas de release, Windows e Linux precisam passar. O CI verifica `nyrva-hook`, `LICENSE`, `CREDITS.md` e `PROVIDER_GLYPH_NOTICES.md` dentro dos pacotes.
 
-O job com `contents: write` cria apenas um **rascunho de GitHub Release**. Os jobs de validação/build têm `contents: read`. PRs normais não criam releases. Não há credenciais de assinatura fictícias nem publicação automática como versão estável.
+Depois do build, o fluxo exige exatamente um `.exe`, um `.deb` e um `.AppImage`, rejeita arquivos vazios, duplicados ou com nomes inseguros e gera `SHA256SUMS`. As cópias legíveis dos três avisos também são anexadas e entram no manifesto de hashes.
 
-## Antes da tag
+Somente o job final tem `contents: write`. Ele cria um **rascunho de GitHub Release**, nunca uma publicação estável automática. Não existem tokens pessoais nem credenciais de assinatura fictícias. PRs normais não criam tags ou releases.
 
-O mantenedor deve revisar/mergear o PR de entrega com CI verde. Não crie tags falsas para testar a publicação. Não renomeie, mova ou reaproveite uma tag já publicada.
+## Escolher a versão
 
-A versão da aplicação deve coincidir em `nyrva/Cargo.toml` e `nyrva/tauri.conf.json`. A tag deve ser `v` seguida dessa versão exata. No estado inicial deste fluxo, ambos declaram `0.3.0`; uma mudança de versão exige PR próprio e atualização correspondente do `Cargo.lock`. Não publique `v1.0.0` enquanto os arquivos ainda declaram `0.3.0`.
+O mantenedor deve revisar e integrar o PR com CI verde. A versão deve coincidir em `nyrva/Cargo.toml` e `nyrva/tauri.conf.json`; a tag é `v` seguida dessa versão exata. Uma mudança de versão exige também a atualização correspondente do `Cargo.lock`.
 
-Faça uma pré-validação sem escrever no GitHub. Na raiz, em um shell com Python 3.11+:
+Mantenha as notas com créditos e limitações em `docs/releases/<tag>.md`. O fluxo recusa notas ausentes ou vazias. Não crie tags falsas de teste, não reaproveite uma tag publicada e não declare testes manuais que não foram executados.
+
+Na raiz, com Python 3.11+:
 
 ```bash
-python -m unittest discover -s tests -p 'test_release_tools.py' -v
+python -m unittest discover -s tests -p 'test_*.py' -v
 python scripts/release_tools.py validate-tag --ref-type tag --tag v0.3.0
 ```
 
-O segundo comando apenas valida os arquivos locais; **não cria nem publica uma tag**. Para outra versão, use o número declarado no commit escolhido.
+Esses comandos validam arquivos locais; não escrevem no GitHub.
 
-## Criar o candidato
+## Caminho A — solicitar o candidato por PR
 
-Depois de escolher um commit revisado, limpo e com CI aprovado, confira seu SHA completo e crie a tag correspondente. Para a versão `0.3.0`, os comandos abaixo são ações reais e devem ser executados deliberadamente pelo mantenedor, apenas quando essa versão for a escolhida:
+Atualize deliberadamente `.github/release-request.json` para a versão escolhida, junto das versões e das notas. O arquivo aceita somente esta estrutura:
+
+```json
+{
+  "tag": "v0.3.0"
+}
+```
+
+Ao integrar a alteração na `main`, o workflow **Release** valida o pedido e compila/testa/empacota esse commit. Só depois dos jobs aprovados ele cria a tag no SHA exato do build e anexa os arquivos ao rascunho. Não altera ou substitui uma tag existente que aponte para outro commit.
+
+O `GITHUB_TOKEN` usado para criar a tag não dispara outro workflow de push. Por isso a mesma execução já realiza o build e cria o rascunho; esse caminho não depende de um segundo disparo implícito. O caminho por tag continua disponível normalmente.
+
+Alterar apenas README, notas antigas ou outro arquivo não solicita uma release: o disparo de branch exige mudança em `.github/release-request.json`. Para uma versão futura, atualize o pedido em um novo PR. Não altere o pedido só para repetir uma release já existente.
+
+## Caminho B — criar uma tag explicitamente
+
+Após escolher um commit limpo, revisado e com CI aprovado, confira seu SHA e crie a tag. Para a versão `0.3.0`, os comandos abaixo são ações reais:
 
 ```bash
 git status --short
@@ -34,53 +52,56 @@ git tag -a v0.3.0 -m "Nyrva 0.3.0 release candidate"
 git push origin v0.3.0
 ```
 
-Não execute a sequência com arquivos locais pendentes ou em um commit não aprovado. Use `git checkout <SHA_APROVADO>` antes, caso o checkout atual não seja o commit selecionado.
-
-Acompanhe o workflow **Release** e confira a existência de todos os pacotes no rascunho. A tag cria um candidato técnico; não é o aceite do MVP. O `gh release create` usa `--verify-tag --draft` e não substitui uma release existente.
+Execute apenas no commit escolhido e quando a tag ainda não existir. Não crie uma segunda tag se o caminho A já a criou. O workflow valida que a tag continua apontando para o commit compilado antes de anexar os arquivos.
 
 ## Aceite antes da publicação
 
-Baixe os arquivos do rascunho usando uma conta com acesso e execute [SMOKE_TESTS.md](SMOKE_TESTS.md). Registre a tag, SHA do build, execução, hashes, ambientes, resultados e responsável em um PR de evidências.
+Acompanhe o workflow **Release** e confira os três pacotes, os avisos e `SHA256SUMS` no rascunho. A existência da tag ou do rascunho não aprova o MVP.
 
-No Linux, com todos os pacotes e `SHA256SUMS` na mesma pasta:
+Baixe os arquivos com uma conta que tenha acesso e execute [SMOKE_TESTS.md](SMOKE_TESTS.md). Registre tag, SHA do build, execução, hashes, ambientes, resultados e responsável em um PR de evidências. Os arquivos publicados devem ser exatamente os testados.
+
+Com todos os arquivos e o manifesto na mesma pasta, no Linux:
 
 ```bash
 sha256sum -c SHA256SUMS
 ```
 
-No PowerShell, calcule o hash do arquivo baixado e compare com a entrada exata do manifesto:
+No PowerShell, calcule o hash do instalador e compare com a entrada exata do manifesto:
 
 ```powershell
 Get-FileHash ./NOME_DO_INSTALADOR.exe -Algorithm SHA256
 ```
 
-SHA-256 confirma integridade, não assinatura/procedência por si só. Os pacotes deste fluxo não são assinados. Não desative controles de segurança para instalá-los.
+Os pacotes não são assinados. SHA-256 verifica integridade, não identidade do publicador. Não desative proteções do sistema operacional para instalar o candidato.
 
-Apenas depois do aceite, publique o rascunho na interface do GitHub ou com o GitHub CLI autenticado:
+Somente depois do aceite e da autorização do responsável, publique o rascunho pela interface do GitHub ou com o GitHub CLI autenticado:
 
 ```bash
 gh release edit v0.3.0 --draft=false
 ```
 
-Use a versão realmente testada. Confira nas notas o commit, ambientes validados, limitações e vínculo para o registro de aceite. `--prerelease` é apropriado quando a versão e o anúncio forem explicitamente de pré-lançamento; não apresente esse resultado como versão estável validada.
+Use a versão realmente testada. Um eventual pré-lançamento público precisa ser anunciado explicitamente como tal, com suas limitações; não é uma versão estável validada.
 
 ## Falhas e recuperação
 
-Se versão, testes ou pacotes falharem, corrija antes de tentar publicar. Não use artefatos de outro commit para completar uma execução incompleta.
+Se versão, testes ou pacotes falharem, corrija antes da publicação. Não misture artefatos de commits ou execuções diferentes.
 
-Se a criação do rascunho falhar após anexar apenas parte dos arquivos, revise o rascunho existente. A automação não o sobrescreve. Um mantenedor pode remover **somente o rascunho incompleto**, preservando a tag, e reexecutar o workflow do mesmo commit. Nunca apague uma release publicada ou sua tag para reaproveitar o número de versão.
+O fluxo nunca move tags nem sobrescreve releases. Se a tag já foi criada no mesmo SHA, uma reexecução pode reutilizá-la; se apontar para outro SHA, a operação falha. Se houver um rascunho incompleto, revise-o antes de agir: um mantenedor pode remover somente esse rascunho, preservando a tag, e reexecutar o workflow original ou selecionar essa tag em **Run workflow**.
 
-Uma mudança de código depois da tag exige uma nova versão/tag e novo aceite dos novos binários. Não substitua silenciosamente um pacote já testado ou distribuído.
+Nunca apague uma release publicada ou sua tag para reaproveitar o número. Mudanças no código depois da tag exigem uma nova versão, novos pacotes e novo aceite.
 
-## Fora deste fechamento
+## Apresentação do repositório
 
-Renomear o repositório é uma operação administrativa separada. Até essa mudança acontecer, use o endereço real do repositório; os workflows usam `github.repository`, sem fixar um futuro nome. Limpe branches antigas somente após preservar os planos e verificar a integração na `main`.
+O About é metadado administrativo do GitHub, não é atualizado por um commit no README. Descrição sugerida:
 
-Não são requisitos deste MVP: Wayland, macOS, nova interface, provedores novos, sincronização, telemetria e atualização automática.
+> Cross-platform AI coding usage monitor for Windows and Linux X11, built with Rust + Tauri. Independent fork of Codenotch.
+
+Mantenha os créditos explícitos no README, em `CREDITS.md` e nas notas. Renomear o repositório é uma operação separada; os workflows usam `github.repository`, não um endereço futuro fixo.
 
 ## Referências
 
-- [Workflow reutilizável do projeto](../.github/workflows/ci.yml)
-- [GitHub: reutilizar workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
+- [CI reutilizável](../.github/workflows/ci.yml)
+- [GitHub: disparos e GITHUB_TOKEN](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
 - [GitHub CLI: criar releases](https://cli.github.com/manual/gh_release_create)
-- [Especificação de aceite M5–M8](superpowers/specs/2026-09-09-linux-provider-parity-and-release-design.md)
+- [Tauri: incluir recursos nos pacotes](https://v2.tauri.app/develop/resources/)
+- [Especificação de aceite](superpowers/specs/2026-09-09-linux-provider-parity-and-release-design.md)
