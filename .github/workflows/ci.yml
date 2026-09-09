@@ -1,8 +1,5 @@
 name: CI
 
-permissions:
-  contents: write
-
 on:
   push:
     branches: [main]
@@ -25,8 +22,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Tauri Linux dependencies
         run: |
@@ -46,17 +41,6 @@ jobs:
             xdg-utils
       - name: Cargo check
         run: cargo check --workspace
-      - name: Refresh Cargo.lock on feature branch
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        run: |
-          if ! git diff --quiet -- Cargo.lock; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
-            git commit -m "chore: refresh Cargo.lock for Linux dependencies"
-            git push origin HEAD:${{ github.head_ref }}
-            exit 1
-          fi
       - name: Verify Cargo.lock is up to date
         run: git diff --exit-code -- Cargo.lock
       - name: Cargo test
