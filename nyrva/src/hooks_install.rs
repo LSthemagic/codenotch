@@ -108,6 +108,8 @@ pub fn uninstall() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{bundled_hook_path, hook_binary_name, hook_command, persistent_hook_path_from};
+    #[cfg(target_os = "linux")]
+    use super::install_hook_binary_to;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -137,5 +139,31 @@ mod tests {
     fn hook_command_quotes_paths_with_spaces() {
         let path = Path::new("/home/alice/Nyrva Data/bin/nyrva-hook");
         assert_eq!(hook_command(path, "running"), "\"/home/alice/Nyrva Data/bin/nyrva-hook\" running");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_hook_copy_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let unique = format!(
+            "nyrva-hook-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source = root.join("source-hook");
+        let destination = root.join("data/nyrva/bin/nyrva-hook");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"hook-bytes").unwrap();
+
+        let installed = install_hook_binary_to(&source, &destination).unwrap();
+        assert_eq!(installed, destination);
+        assert_eq!(std::fs::read(&installed).unwrap(), b"hook-bytes");
+        assert_ne!(std::fs::metadata(&installed).unwrap().permissions().mode() & 0o111, 0);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
