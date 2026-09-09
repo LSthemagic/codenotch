@@ -53,8 +53,16 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn codex_home_from(env: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    env.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".codex")))
+}
+
 fn codex_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex"))
+    let env = std::env::var_os("CODEX_HOME");
+    let home = dirs::home_dir();
+    codex_home_from(env.as_deref(), home.as_deref())
 }
 
 fn store_path() -> PathBuf {
