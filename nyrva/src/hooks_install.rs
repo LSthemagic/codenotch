@@ -39,11 +39,35 @@ fn install_hook_binary_to(source: &Path, destination: &Path) -> Result<PathBuf, 
 
     let parent = destination.parent().ok_or("invalid persistent hook destination")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    std::fs::copy(source, destination).map_err(|e| e.to_string())?;
-    let mut permissions = std::fs::metadata(destination).map_err(|e| e.to_string())?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(destination, permissions).map_err(|e| e.to_string())?;
-    Ok(destination.to_path_buf())
+
+    // Never truncate the live helper in place. Copy to the same directory and atomically
+    // rename it over the destination; Linux permits replacing an executable that is running.
+    let temp = parent.join(format!(".nyrva-hook.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    if let Err(e) = std::fs::copy(source, &temp) {
+        return Err(e.to_string());
+    }
+    let result = (|| {
+        let mut permissions = std::fs::metadata(&temp).map_err(|e| e.to_string())?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&temp, permissions).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, destination).map_err(|e| e.to_string())?;
+        Ok(destination.to_path_buf())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn remove_persistent_hook_from(data_dir: &Path) -> Result<bool, String> {
+    let helper = persistent_hook_path_from(data_dir);
+    match std::fs::remove_file(helper) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -132,35 +156,46 @@ pub fn install() -> Result<String, String> {
 
 pub fn uninstall() -> Result<String, String> {
     let path = settings_path().ok_or("cannot find the user directory")?;
-    if !path.exists() { return Ok("settings.json does not exist, nothing to uninstall".into()); }
-    let mut root = load(&path);
-    let Some(hooks) = root["hooks"].as_object_mut() else { return Ok("no hooks configuration found".into()); };
-    let mut removed = 0;
-    for (_, v) in hooks.iter_mut() {
-        if let Some(arr) = v.as_array() {
-            let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
-            removed += arr.len() - filtered.len();
-            *v = json!(filtered);
+    let settings_result = if !path.exists() {
+        "settings.json does not exist, nothing to uninstall".to_string()
+    } else {
+        let mut root = load(&path);
+        if let Some(hooks) = root["hooks"].as_object_mut() {
+            let mut removed = 0;
+            for (_, v) in hooks.iter_mut() {
+                if let Some(arr) = v.as_array() {
+                    let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
+                    removed += arr.len() - filtered.len();
+                    *v = json!(filtered);
+                }
+            }
+            backup_and_write(&path, &root)?;
+            format!("removed {removed} Nyrva hook(s)")
+        } else {
+            "no hooks configuration found".to_string()
         }
-    }
-    backup_and_write(&path, &root)?;
+    };
 
     #[cfg(target_os = "linux")]
-    if let Some(data_dir) = dirs::data_local_dir() {
-        let helper = persistent_hook_path_from(&data_dir);
-        if helper.exists() {
-            let _ = std::fs::remove_file(helper);
-        }
+    {
+        let helper_removed = match dirs::data_local_dir() {
+            Some(data_dir) => remove_persistent_hook_from(&data_dir)?,
+            None => false,
+        };
+        return Ok(format!(
+            "{settings_result}; persistent helper {}",
+            if helper_removed { "removed" } else { "not present" }
+        ));
     }
-
-    Ok(format!("removed {removed} Nyrva hook(s)"))
+    #[cfg(not(target_os = "linux"))]
+    Ok(settings_result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{hook_binary_name, hook_command};
     #[cfg(target_os = "linux")]
-    use super::{bundled_hook_path, install_hook_binary_to, persistent_hook_path_from};
+    use super::{bundled_hook_path, install_hook_binary_to, persistent_hook_path_from, remove_persistent_hook_from};
     use std::path::Path;
     #[cfg(target_os = "linux")]
     use std::path::PathBuf;
@@ -198,7 +233,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn persistent_hook_copy_is_executable() {
+    fn persistent_hook_copy_is_executable_and_replaceable() {
         use std::os::unix::fs::PermissionsExt;
         let unique = format!(
             "nyrva-hook-test-{}-{}",
@@ -212,13 +247,40 @@ mod tests {
         let source = root.join("source-hook");
         let destination = root.join("data/nyrva/bin/nyrva-hook");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(&source, b"hook-bytes").unwrap();
+        std::fs::write(&source, b"hook-v1").unwrap();
 
         let installed = install_hook_binary_to(&source, &destination).unwrap();
         assert_eq!(installed, destination);
-        assert_eq!(std::fs::read(&installed).unwrap(), b"hook-bytes");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"hook-v1");
         assert_ne!(std::fs::metadata(&installed).unwrap().permissions().mode() & 0o111, 0);
 
+        std::fs::write(&source, b"hook-v2").unwrap();
+        install_hook_binary_to(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"hook-v2");
+
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_hook_removal_is_idempotent() {
+        let unique = format!(
+            "nyrva-hook-remove-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let data_dir = std::env::temp_dir().join(unique);
+        let helper = persistent_hook_path_from(&data_dir);
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(&helper, b"hook").unwrap();
+
+        assert!(remove_persistent_hook_from(&data_dir).unwrap());
+        assert!(!helper.exists());
+        assert!(!remove_persistent_hook_from(&data_dir).unwrap());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
