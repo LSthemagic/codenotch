@@ -1,39 +1,14 @@
-//! Antigravity (Google's IDE, Gemini quota) usage adapter, implemented from the upstream
-//! Codenotch's documented behaviour.
+//! Antigravity (Google's IDE, Gemini quota) usage adapter.
 //!
-//! Google publishes no usage numbers to third parties: `cloudcode-pa`'s `retrieveUserQuotaSummary`
-//! answers a personal account with 403 #3501 "no valid license" (it looks at *who* is asking, and
-//! impersonating Antigravity is off the table). Upstream's answer is Antigravity's own answer: ask
-//! the language_server running on this machine — it holds the credential and the client identity
-//! and asks Google itself.
+//! Data sources, in trust order:
+//! 1. Antigravity's local `language_server` bridge.
+//! 2. The last bridge reading, marked stale, when the IDE closes.
+//! 3. Antigravity's own Google credential, borrowed read-only from the native credential store.
+//! 4. A derived count from Antigravity transcripts when Google publishes no quota for the account.
 //!
-//! Data paths, most honest first (same as upstream):
-//!   1. Local bridge: find the `language_server*` process (its command line carries
-//!      `--csrf_token <t>`; the port is `--https_server_port 0`, i.e. random at runtime, and can
-//!      only be found in the listening table; it opens two ports and only one answers this RPC,
-//!      so both are tried),
-//!      POST `https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
-//!      with header `x-codeium-csrf-token: <t>` (Antigravity sits on the Codeium stack; the header
-//!      name never changed) and body `{"forceRefresh":true}` (otherwise the server answers from
-//!      QuotaSummaryCache). Self-signed certificate → verification is relaxed for 127.0.0.1 only.
-//!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, remainingFraction, resetTime}]}]}}`
-//!      — it reports what **remains**, so used = 1 - remainingFraction; the label is
-//!      group.displayName (buckets only ever say "Weekly Limit Remaining").
-//!   2. Bridge answered before and does not now = Antigravity is closed (the port changes on every
-//!      launch): keep the last percentage marked stale rather than switching to a count.
-//!   3. Credential path (when a Google token exists): Windows Credential Manager target
-//!      `gemini:antigravity` (Go keyring: service:user), value JSON
-//!      `{auth_method, token:{access_token, expiry (RFC3339 with offset)}}`; on macOS it carries a
-//!      `go-keyring-base64:` prefix, and both forms are accepted. POST `:loadCodeAssist`
-//!      (`{"metadata":{"pluginType":"GEMINI"}}`, not ANTIGRAVITY) for the tier name; then try
-//!      `:retrieveUserQuotaSummary` (empty body `{}`), which is 200 only for licensed accounts, and
-//!      parse it defensively (no positive limit, or used > 1.5×limit → discard).
-//!   4. Fallback: count today's `source=="MODEL"` steps in
-//!      `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl` (created_at is UTC,
-//!      compared by local day). This is a **count, not a percentage** — there is no published
-//!      denominator, so the ring draws only its track.
-//!
-//! Read only; token values are never cached and never appear in any log.
+//! Linux parity is native: `/proc` is used to discover the language server and its listening
+//! sockets, and Secret Service is accessed through the Rust `keyring` backend. No `ps`, `lsof`,
+//! or provider-owned files are modified. Token values never reach logs, events, or the UI.
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
@@ -88,7 +63,6 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-/// Is Antigravity installed: the state directory exists, or Credential Manager holds its token
 pub fn present() -> bool {
     state_root().map(|p| p.is_dir()).unwrap_or(false) || read_credential_raw().is_some()
 }
@@ -101,21 +75,21 @@ struct Endpoint {
     csrf: String,
 }
 
+#[cfg(windows)]
 fn run_hidden(program: &str, args: &[&str]) -> String {
     let mut cmd = std::process::Command::new(program);
-    cmd.args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    cmd.output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000);
+    cmd.output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
-/// The process table is the only source of truth: the token is on the command line and the port is written nowhere
 #[cfg(windows)]
 fn discover() -> Option<Endpoint> {
-    // PowerShell CIM query: one "pid<TAB>commandline" per line
     let table = run_hidden(
         "powershell",
         &[
@@ -135,44 +109,77 @@ fn discover() -> Option<Endpoint> {
     }
     Some(Endpoint { ports, csrf })
 }
-#[cfg(not(windows))]
+
+#[cfg(target_os = "linux")]
 fn discover() -> Option<Endpoint> {
-    let table = run_hidden("ps", &["-Ao", "pid,command"]);
-    let line = table.lines().find(|l| l.contains("language_server") && l.contains("--csrf_token"))?;
-    let pid: u32 = line.trim().split_whitespace().next()?.parse().ok()?;
-    let csrf = flag_value(line, "--csrf_token")?;
-    let out = run_hidden("lsof", &["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"]);
-    let ports: Vec<u16> = out
-        .lines()
-        .filter_map(|l| l.split_whitespace().rev().find(|w| w.contains(':')))
-        .filter_map(|a| a.rsplit(':').next()?.parse().ok())
-        .collect();
-    if ports.is_empty() {
-        return None;
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(raw) if !raw.is_empty() => raw,
+            _ => continue,
+        };
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        if !args.iter().any(|arg| arg.contains("language_server")) {
+            continue;
+        }
+        let Some(csrf) = flag_value_args(&args, "--csrf_token") else {
+            continue;
+        };
+        let ports = linux_listening_ports_from_proc(pid);
+        if !ports.is_empty() {
+            return Some(Endpoint { ports, csrf });
+        }
     }
-    Some(Endpoint { ports, csrf })
+    None
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn discover() -> Option<Endpoint> {
+    None
 }
 
 fn flag_value(line: &str, flag: &str) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let i = parts.iter().position(|p| *p == flag)?;
+    let i = parts.iter().position(|part| *part == flag)?;
     parts.get(i + 1).map(|s| s.trim_matches('"').to_string())
 }
 
-/// netstat -ano: `TCP 127.0.0.1:PORT 0.0.0.0:0 LISTENING PID`
+#[cfg(target_os = "linux")]
+fn flag_value_args(args: &[String], flag: &str) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return args.get(index + 1).cloned().filter(|value| !value.is_empty());
+        }
+        if let Some(value) = arg.strip_prefix(flag).and_then(|rest| rest.strip_prefix('=')) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(windows)]
 fn listening_ports(pid: u32) -> Vec<u16> {
     let out = run_hidden("netstat", &["-ano", "-p", "TCP"]);
     let pid_s = pid.to_string();
     let mut ports: Vec<u16> = out
         .lines()
-        .filter(|l| l.contains("LISTENING"))
-        .filter_map(|l| {
-            let cols: Vec<&str> = l.split_whitespace().collect();
+        .filter(|line| line.contains("LISTENING"))
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() < 5 || cols[4] != pid_s {
                 return None;
             }
-            cols[1].rsplit(':').next()?.parse::<u16>().ok()
+            cols[1].rsplit(':').next()?.parse().ok()
         })
         .collect();
     ports.sort_unstable();
@@ -180,14 +187,85 @@ fn listening_ports(pid: u32) -> Vec<u16> {
     ports
 }
 
-/// Loopback only: the self-signed certificate is accepted for 127.0.0.1 alone (never used for any public request)
+#[cfg(target_os = "linux")]
+fn process_socket_inodes(pid: u32) -> std::collections::HashSet<u64> {
+    let mut inodes = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return inodes;
+    };
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let text = target.to_string_lossy();
+        let Some(inode) = text
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        inodes.insert(inode);
+    }
+    inodes
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_net_listening_ports(
+    text: &str,
+    inodes: &std::collections::HashSet<u64>,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() <= 9 || cols[3] != "0A" {
+            continue;
+        }
+        let Some(inode) = cols[9].parse::<u64>().ok() else {
+            continue;
+        };
+        if !inodes.contains(&inode) {
+            continue;
+        }
+        let Some(port_hex) = cols[1].rsplit(':').next() else {
+            continue;
+        };
+        if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+#[cfg(target_os = "linux")]
+fn linux_listening_ports_from_proc(pid: u32) -> Vec<u16> {
+    let inodes = process_socket_inodes(pid);
+    if inodes.is_empty() {
+        return Vec::new();
+    }
+    let mut ports = Vec::new();
+    for name in ["tcp", "tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/net/{name}")) {
+            ports.extend(parse_proc_net_listening_ports(&text, &inodes));
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 fn local_agent() -> Option<ureq::Agent> {
     let tls = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
         .build()
         .ok()?;
-    Some(ureq::AgentBuilder::new().tls_connector(Arc::new(tls)).timeout(Duration::from_secs(10)).build())
+    Some(
+        ureq::AgentBuilder::new()
+            .tls_connector(Arc::new(tls))
+            .timeout(Duration::from_secs(10))
+            .build(),
+    )
 }
 
 fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
@@ -201,47 +279,58 @@ fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
             .set(CSRF_HEADER, &ep.csrf)
             .send_string(r#"{"forceRefresh":true}"#)
         {
-            Ok(r) => match r.into_json::<serde_json::Value>() {
-                Ok(v) => {
-                    let w = windows_from_bridge(&v);
-                    if !w.is_empty() {
-                        return Ok(w);
+            Ok(response) => match response.into_json::<serde_json::Value>() {
+                Ok(value) => {
+                    let windows = windows_from_bridge(&value);
+                    if !windows.is_empty() {
+                        return Ok(windows);
                     }
                     last = format!("port {port}: no recognisable groups");
                 }
-                Err(e) => last = format!("port {port}: {e}"),
+                Err(error) => last = format!("port {port}: {error}"),
             },
             Err(ureq::Error::Status(code, _)) => last = format!("port {port}: HTTP {code}"),
-            Err(e) => last = format!("port {port}: {e}"),
+            Err(error) => last = format!("port {port}: {error}"),
         }
     }
     Err(last)
 }
 
-fn parse_iso(v: Option<&serde_json::Value>) -> Option<u64> {
-    v.and_then(|x| x.as_str())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.timestamp_millis().max(0) as u64)
+fn parse_iso(value: Option<&serde_json::Value>) -> Option<u64> {
+    value
+        .and_then(|value| value.as_str())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|date| date.timestamp_millis().max(0) as u64)
 }
 
-/// The server reports what remains and the notch shows what is used: flip it here so the view never learns about provider differences
-pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
+pub fn windows_from_bridge(value: &serde_json::Value) -> Vec<LimitWindow> {
     let mut out = Vec::new();
-    let Some(groups) = v.pointer("/response/groups").and_then(|g| g.as_array()) else { return out };
-    for g in groups {
-        let gname = g.get("displayName").and_then(|x| x.as_str());
-        let Some(buckets) = g.get("buckets").and_then(|b| b.as_array()) else { continue };
-        for b in buckets {
-            let Some(rem) = b.get("remainingFraction").and_then(|x| x.as_f64()) else { continue };
-            if !(0.0..=1.0).contains(&rem) {
+    let Some(groups) = value.pointer("/response/groups").and_then(|groups| groups.as_array()) else {
+        return out;
+    };
+    for group in groups {
+        let group_name = group.get("displayName").and_then(|value| value.as_str());
+        let Some(buckets) = group.get("buckets").and_then(|buckets| buckets.as_array()) else {
+            continue;
+        };
+        for bucket in buckets {
+            let Some(remaining) = bucket.get("remainingFraction").and_then(|value| value.as_f64()) else {
+                continue;
+            };
+            if !(0.0..=1.0).contains(&remaining) {
                 continue;
             }
-            let bname = b.get("displayName").and_then(|x| x.as_str());
+            let bucket_name = bucket.get("displayName").and_then(|value| value.as_str());
             out.push(LimitWindow {
-                id: b.get("bucketId").and_then(|x| x.as_str()).or(gname).unwrap_or("quota").to_string(),
-                label: gname.or(bname).unwrap_or("Usage").to_string(),
-                used: (1.0 - rem).clamp(0.0, 1.0),
-                resets_at: parse_iso(b.get("resetTime")),
+                id: bucket
+                    .get("bucketId")
+                    .and_then(|value| value.as_str())
+                    .or(group_name)
+                    .unwrap_or("quota")
+                    .to_string(),
+                label: group_name.or(bucket_name).unwrap_or("Usage").to_string(),
+                used: (1.0 - remaining).clamp(0.0, 1.0),
+                resets_at: parse_iso(bucket.get("resetTime")),
                 ..Default::default()
             });
         }
@@ -249,7 +338,7 @@ pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
     out
 }
 
-// ---------------- 3. Credential path ----------------
+// ---------------- 3. Credential store ----------------
 
 struct Creds {
     access_token: String,
@@ -257,79 +346,103 @@ struct Creds {
     auth_method: String,
 }
 
-/// Windows Credential Manager: generic credential with target = "gemini:antigravity" (Go keyring's service:user naming)
 #[cfg(windows)]
 fn read_credential_raw() -> Option<Vec<u8>> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Credentials::{CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC};
-    let target: Vec<u16> = "gemini:antigravity".encode_utf16().chain(std::iter::once(0)).collect();
+
+    let target: Vec<u16> = "gemini:antigravity"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut pcred: *mut CREDENTIALW = std::ptr::null_mut();
     unsafe {
         if CredReadW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0, &mut pcred).is_err() || pcred.is_null() {
             return None;
         }
-        let c = &*pcred;
-        let blob = if c.CredentialBlobSize > 0 && !c.CredentialBlob.is_null() {
-            std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize).to_vec()
+        let credential = &*pcred;
+        let blob = if credential.CredentialBlobSize > 0 && !credential.CredentialBlob.is_null() {
+            std::slice::from_raw_parts(
+                credential.CredentialBlob,
+                credential.CredentialBlobSize as usize,
+            )
+            .to_vec()
         } else {
             Vec::new()
         };
         CredFree(pcred as *const core::ffi::c_void);
-        if blob.is_empty() {
-            None
-        } else {
-            Some(blob)
-        }
+        (!blob.is_empty()).then_some(blob)
     }
 }
-#[cfg(not(windows))]
+
+#[cfg(target_os = "linux")]
+fn read_credential_raw() -> Option<Vec<u8>> {
+    // Go keyring stores Antigravity with Secret Service attributes service=gemini,
+    // username=antigravity. keyring-rs maps the same service/user pair to that item.
+    let entry = keyring::Entry::new("gemini", "antigravity").ok()?;
+    entry.get_secret().ok().filter(|secret| !secret.is_empty())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn read_credential_raw() -> Option<Vec<u8>> {
     None
 }
 
-/// Raw JSON, or base64 with a `go-keyring-base64:` prefix (UTF-16 storage is accepted too)
 fn decode_credential(raw: &[u8]) -> Option<Creds> {
     let mut text = String::from_utf8(raw.to_vec()).unwrap_or_else(|_| {
-        // Some writers store the blob as UTF-16LE
-        let u16s: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&u16s)
+        let utf16: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        String::from_utf16_lossy(&utf16)
     });
     text = text.trim_matches('\0').trim().to_string();
-    if let Some(rest) = text.strip_prefix("go-keyring-base64:") {
-        let bytes = b64_decode(rest.trim())?;
-        text = String::from_utf8(bytes).ok()?;
+    if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
+        text = String::from_utf8(b64_decode(encoded.trim())?).ok()?;
     }
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let access = v.pointer("/token/access_token")?.as_str()?.to_string();
-    let expiry = v.pointer("/token/expiry").and_then(|x| x.as_str()).unwrap_or("");
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let access_token = value.pointer("/token/access_token")?.as_str()?.to_string();
+    if access_token.is_empty() {
+        return None;
+    }
+    let expiry = value
+        .pointer("/token/expiry")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     let expired = chrono::DateTime::parse_from_rfc3339(expiry)
-        .map(|d| (d.timestamp_millis().max(0) as u64) <= now_ms())
+        .map(|date| date.timestamp_millis().max(0) as u64 <= now_ms())
         .unwrap_or(false);
-    let auth_method = v.get("auth_method").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    Some(Creds { access_token: access, expired, auth_method })
+    let auth_method = value
+        .get("auth_method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(Creds {
+        access_token,
+        expired,
+        auth_method,
+    })
 }
 
-/// Dependency-free base64 (standard alphabet, tolerant of URL-safe characters and missing padding)
-pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+pub(crate) fn b64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0u8;
-    for c in s.bytes() {
-        let sextet: u8 = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
+    for byte in text.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
             b'+' | b'-' => 62,
             b'/' | b'_' => 63,
             b'=' | b'\n' | b'\r' | b' ' => continue,
             _ => return None,
         };
-        let v = sextet as u32;
-        buf = (buf << 6) | v;
+        buf = (buf << 6) | sextet as u32;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            out.push(((buf >> bits) & 0xFF) as u8);
+            out.push(((buf >> bits) & 0xff) as u8);
         }
     }
     Some(out)
@@ -339,7 +452,6 @@ fn read_credentials() -> Option<Creds> {
     decode_credential(&read_credential_raw()?)
 }
 
-/// Tier name ("Personal"/"Pro"…); 401/403 → NeedsAuth
 fn load_tier(token: &str) -> Result<String, String> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     match agent
@@ -348,109 +460,130 @@ fn load_tier(token: &str) -> Result<String, String> {
         .set("Content-Type", "application/json")
         .send_string(r#"{"metadata":{"pluginType":"GEMINI"}}"#)
     {
-        Ok(r) => {
-            let v: serde_json::Value = r.into_json().map_err(|e| e.to_string())?;
-            let tier = v
+        Ok(response) => {
+            let value: serde_json::Value = response.into_json().map_err(|error| error.to_string())?;
+            let tier = value
                 .get("currentTier")
                 .or_else(|| {
-                    v.get("allowedTiers").and_then(|a| a.as_array()).and_then(|a| {
-                        a.iter().find(|t| t.get("isDefault").and_then(|x| x.as_bool()) == Some(true)).or(a.first())
+                    value.get("allowedTiers").and_then(|tiers| tiers.as_array()).and_then(|tiers| {
+                        tiers
+                            .iter()
+                            .find(|tier| tier.get("isDefault").and_then(|value| value.as_bool()) == Some(true))
+                            .or(tiers.first())
                     })
                 })
-                .and_then(|t| t.get("name"))
-                .and_then(|x| x.as_str())
+                .and_then(|tier| tier.get("name"))
+                .and_then(|value| value.as_str())
                 .unwrap_or("Gemini");
             Ok(tier.to_string())
         }
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => Err("needsAuth".into()),
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(e) => Err(e.to_string()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
-/// Direct quota for licensed accounts; a personal account gets 403 → None (not an error)
 fn direct_quota(token: &str) -> Option<Vec<LimitWindow>> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
-    let r = agent
+    let response = agent
         .post(QUOTA_SUMMARY)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_string("{}")
         .ok()?;
-    let v: serde_json::Value = r.into_json().ok()?;
-    let mut buckets: Vec<serde_json::Value> = Vec::new();
-    if let Some(groups) = v.get("quotaGroups").and_then(|g| g.as_array()) {
-        for g in groups {
-            if let Some(bs) = g.get("buckets").and_then(|b| b.as_array()) {
-                buckets.extend(bs.iter().cloned());
+    let value: serde_json::Value = response.into_json().ok()?;
+
+    let mut buckets = Vec::new();
+    if let Some(groups) = value.get("quotaGroups").and_then(|groups| groups.as_array()) {
+        for group in groups {
+            if let Some(group_buckets) = group.get("buckets").and_then(|buckets| buckets.as_array()) {
+                buckets.extend(group_buckets.iter().cloned());
             }
         }
     }
-    if let Some(bs) = v.get("buckets").and_then(|b| b.as_array()) {
-        buckets.extend(bs.iter().cloned());
+    if let Some(top_level) = value.get("buckets").and_then(|buckets| buckets.as_array()) {
+        buckets.extend(top_level.iter().cloned());
     }
-    let out: Vec<LimitWindow> = buckets
+
+    let windows: Vec<LimitWindow> = buckets
         .iter()
-        .filter_map(|b| {
-            let limit = b.get("limit").and_then(|x| x.as_f64())?;
-            let used = b.get("used").and_then(|x| x.as_f64())?;
+        .filter_map(|bucket| {
+            let limit = bucket.get("limit").and_then(|value| value.as_f64())?;
+            let used = bucket.get("used").and_then(|value| value.as_f64())?;
             if limit <= 0.0 || used < 0.0 || used > limit * 1.5 {
-                return None; // defensive: a reply of the wrong shape draws no ring
+                return None;
             }
-            let label = b
+            let label = bucket
                 .get("displayName")
-                .or_else(|| b.get("name"))
-                .and_then(|x| x.as_str())
+                .or_else(|| bucket.get("name"))
+                .and_then(|value| value.as_str())
                 .unwrap_or("Usage")
                 .to_string();
             Some(LimitWindow {
-                id: b.get("name").and_then(|x| x.as_str()).unwrap_or(&label).to_string(),
+                id: bucket
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&label)
+                    .to_string(),
                 label,
                 used: (used / limit).clamp(0.0, 1.0),
-                resets_at: parse_iso(b.get("resetTime")),
+                resets_at: parse_iso(bucket.get("resetTime")),
                 ..Default::default()
             })
         })
         .collect();
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    (!windows.is_empty()).then_some(windows)
 }
 
-// ---------------- 4. Fallback count ----------------
+// ---------------- 4. Transcript fallback ----------------
 
-/// Today's MODEL steps (UTC timestamps compared by local day)
 pub fn requests_today() -> (u64, Option<u64>) {
-    use chrono::{Datelike, Local, TimeZone};
-    let Some(root) = state_root().map(|r| r.join("brain")) else { return (0, None) };
-    let Ok(rd) = std::fs::read_dir(&root) else { return (0, None) };
+    use chrono::{Local, TimeZone};
+
+    let Some(root) = state_root().map(|root| root.join("brain")) else {
+        return (0, None);
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (0, None);
+    };
     let today = Local::now().date_naive();
     let mut count = 0u64;
-    let mut latest: Option<u64> = None;
-    for e in rd.flatten() {
-        let p = e.path().join(".system_generated").join("logs").join("transcript.jsonl");
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+    let mut latest = None;
+    for entry in entries.flatten() {
+        let path = entry
+            .path()
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
         for line in text.lines() {
             if !line.contains("\"MODEL\"") {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if v.get("source").and_then(|x| x.as_str()) != Some("MODEL") {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("source").and_then(|value| value.as_str()) != Some("MODEL") {
                 continue;
             }
-            let Some(ts) = v.get("created_at").and_then(|x| x.as_str()) else { continue };
-            let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
-            let ms = dt.timestamp_millis().max(0) as u64;
-            latest = Some(latest.map_or(ms, |l| l.max(ms)));
-            let local = Local.timestamp_millis_opt(ms as i64).single();
-            if let Some(l) = local {
-                if l.date_naive() == today {
-                    count += 1;
-                }
+            let Some(timestamp) = value.get("created_at").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Ok(date) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+                continue;
+            };
+            let millis = date.timestamp_millis().max(0) as u64;
+            latest = Some(latest.map_or(millis, |current: u64| current.max(millis)));
+            if Local
+                .timestamp_millis_opt(millis as i64)
+                .single()
+                .map(|local| local.date_naive() == today)
+                .unwrap_or(false)
+            {
+                count += 1;
             }
-            let _ = today.year(); // keeps the Datelike import in use
         }
     }
     (count, latest)
@@ -463,108 +596,113 @@ struct Runtime {
     ever_bridged: bool,
 }
 
-fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
-    let mut snap = UsageSnapshot::default();
-    // 1. Local bridge (the cached endpoint first; the port changes on every launch, so a miss is normal)
-    let mut bridge_err = String::new();
-    let mut tried = false;
-    if let Some(ep) = rt.endpoint.clone() {
-        tried = true;
-        match bridge_quota(&ep) {
-            Ok(w) => {
-                rt.ever_bridged = true;
-                snap.status = "ok".into();
-                snap.windows = w;
-                snap.fetched_at = now_ms();
-                snap.note = "via Antigravity".into();
-                return snap;
+fn read_once(runtime: &mut Runtime, previous: &UsageSnapshot) -> UsageSnapshot {
+    let mut snapshot = UsageSnapshot::default();
+    let mut bridge_error = String::new();
+    let mut bridge_tried = false;
+
+    if let Some(endpoint) = runtime.endpoint.clone() {
+        bridge_tried = true;
+        match bridge_quota(&endpoint) {
+            Ok(windows) => {
+                runtime.ever_bridged = true;
+                snapshot.status = "ok".into();
+                snapshot.windows = windows;
+                snapshot.fetched_at = now_ms();
+                snapshot.note = "via Antigravity".into();
+                return snapshot;
             }
-            Err(e) => {
-                bridge_err = e;
-                rt.endpoint = None;
+            Err(error) => {
+                bridge_error = error;
+                runtime.endpoint = None;
             }
         }
     }
-    if let Some(ep) = discover() {
-        tried = true;
-        match bridge_quota(&ep) {
-            Ok(w) => {
-                rt.endpoint = Some(ep);
-                rt.ever_bridged = true;
-                snap.status = "ok".into();
-                snap.windows = w;
-                snap.fetched_at = now_ms();
-                snap.note = "via Antigravity".into();
-                return snap;
+
+    if let Some(endpoint) = discover() {
+        bridge_tried = true;
+        match bridge_quota(&endpoint) {
+            Ok(windows) => {
+                runtime.endpoint = Some(endpoint);
+                runtime.ever_bridged = true;
+                snapshot.status = "ok".into();
+                snapshot.windows = windows;
+                snapshot.fetched_at = now_ms();
+                snapshot.note = "via Antigravity".into();
+                return snapshot;
             }
-            Err(e) => bridge_err = e,
+            Err(error) => bridge_error = error,
         }
     }
-    if tried && !bridge_err.is_empty() {
-        crate::applog(&format!("antigravity: local bridge failed ({bridge_err})"));
+
+    if bridge_tried && !bridge_error.is_empty() {
+        crate::applog(&format!("antigravity: local bridge failed ({bridge_error})"));
     }
-    // 2. The bridge worked before: keep the last percentage marked stale instead of degrading to a count (8% → 31 looks broken)
-    if rt.ever_bridged && !prev.windows.is_empty() {
-        snap = prev.clone();
-        snap.status = "stale".into();
-        snap.note = "Antigravity is closed — last reading kept".into();
-        return snap;
+
+    if runtime.ever_bridged && !previous.windows.is_empty() {
+        snapshot = previous.clone();
+        snapshot.status = "stale".into();
+        snapshot.note = "Antigravity is closed — last reading kept".into();
+        return snapshot;
     }
-    // 3. Credential path
-    let mut tier: Option<String> = None;
+
+    let mut tier = None;
     match read_credentials() {
-        Some(c) if !c.expired => match load_tier(&c.access_token) {
-            Ok(t) => {
-                tier = Some(t);
-                if let Some(w) = direct_quota(&c.access_token) {
-                    snap.status = "ok".into();
-                    snap.windows = w;
-                    snap.fetched_at = now_ms();
-                    snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
-                    return snap;
+        Some(credentials) if !credentials.expired => match load_tier(&credentials.access_token) {
+            Ok(current_tier) => {
+                tier = Some(current_tier);
+                if let Some(windows) = direct_quota(&credentials.access_token) {
+                    snapshot.status = "ok".into();
+                    snapshot.windows = windows;
+                    snapshot.fetched_at = now_ms();
+                    snapshot.note = format!("{} · via Google", tier.clone().unwrap_or_default());
+                    return snapshot;
                 }
             }
-            Err(e) if e == "needsAuth" => {
-                snap.status = "needsAuth".into();
-                snap.note = "Antigravity's Google session was rejected — sign in again in Antigravity".into();
-                return snap;
+            Err(error) if error == "needsAuth" => {
+                snapshot.status = "needsAuth".into();
+                snapshot.note = "Antigravity's Google session was rejected — sign in again in Antigravity".into();
+                return snapshot;
             }
-            Err(e) => crate::applog(&format!("antigravity: loadCodeAssist {e}")),
+            Err(error) => crate::applog(&format!("antigravity: loadCodeAssist {error}")),
         },
-        Some(c) => {
-            // Expired ≠ signed out: Antigravity refreshes it on its next run; auth_method stands in for the tier
-            tier = Some(if c.auth_method == "consumer" { "Personal".into() } else { c.auth_method.clone() });
+        Some(credentials) => {
+            tier = Some(if credentials.auth_method == "consumer" {
+                "Personal".into()
+            } else {
+                credentials.auth_method
+            });
         }
         None => {}
     }
-    // 4. Count fallback (derived: the card gets a ~ prefix and the ring draws only its track)
-    let (n, latest) = requests_today();
-    snap.status = "ok".into();
-    snap.fetched_at = latest.unwrap_or_else(now_ms);
-    snap.windows = vec![LimitWindow {
+
+    let (count, latest) = requests_today();
+    snapshot.status = "ok".into();
+    snapshot.fetched_at = latest.unwrap_or_else(now_ms);
+    snapshot.windows = vec![LimitWindow {
         id: "requests".into(),
         label: "Requests today · no limit published".into(),
         used: 0.0,
         resets_at: None,
-        count: Some(n as i64),
+        count: Some(count as i64),
         derived: true,
     }];
-    snap.note = match tier {
-        Some(t) => format!("{t} · Google publishes no quota for this account"),
+    snapshot.note = match tier {
+        Some(tier) => format!("{tier} · Google publishes no quota for this account"),
         None => "Open Antigravity to read its quota".into(),
     };
-    snap
+    snapshot
 }
 
-fn broadcast(app: &AppHandle, snap: UsageSnapshot) {
-    let st = app.state::<AppState>();
-    *st.antigravity.lock().unwrap() = snap.clone();
-    persist(&snap);
-    let _ = app.emit("antigravity", &snap);
+fn broadcast(app: &AppHandle, snapshot: UsageSnapshot) {
+    let state = app.state::<AppState>();
+    *state.antigravity.lock().unwrap() = snapshot.clone();
+    persist(&snapshot);
+    let _ = app.emit("antigravity", &snapshot);
 }
 
-fn sleep_interruptible(secs: u64) {
-    for _ in 0..secs {
+fn sleep_interruptible(seconds: u64) {
+    for _ in 0..seconds {
         if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -575,12 +713,18 @@ fn sleep_interruptible(secs: u64) {
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         {
-            let st = app.state::<AppState>();
-            let snap = st.antigravity.lock().unwrap().clone();
-            let _ = app.emit("antigravity", &snap);
+            let state = app.state::<AppState>();
+            let snapshot = state.antigravity.lock().unwrap().clone();
+            let _ = app.emit("antigravity", &snapshot);
         }
         if !present() {
-            broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
+            broadcast(
+                &app,
+                UsageSnapshot {
+                    status: "absent".into(),
+                    ..Default::default()
+                },
+            );
             loop {
                 sleep_interruptible(600);
                 if present() {
@@ -588,37 +732,93 @@ pub fn start(app: AppHandle) {
                 }
             }
         }
-        let mut rt = Runtime { endpoint: None, ever_bridged: false };
+
+        let mut runtime = Runtime {
+            endpoint: None,
+            ever_bridged: false,
+        };
         loop {
-            let prev = {
-                let st = app.state::<AppState>();
-                let s = st.antigravity.lock().unwrap().clone();
-                s
+            let previous = {
+                let state = app.state::<AppState>();
+                let snapshot = state.antigravity.lock().unwrap().clone();
+                snapshot
             };
-            let snap = read_once(&mut rt, &prev);
-            broadcast(&app, snap);
+            let snapshot = read_once(&mut runtime, &previous);
+            broadcast(&app, snapshot);
             sleep_interruptible(POLL_SECS);
         }
     });
 }
 
-/// For doctor: contains no secrets
 pub fn probe() -> String {
-    let root = state_root().map(|p| p.display().to_string()).unwrap_or_default();
-    let has_root = state_root().map(|p| p.is_dir()).unwrap_or(false);
-    let cred = read_credentials();
-    let ep = discover();
+    let root = state_root().map(|path| path.display().to_string()).unwrap_or_default();
+    let has_root = state_root().map(|path| path.is_dir()).unwrap_or(false);
+    let credential = read_credentials();
+    let endpoint = discover();
     format!(
-        "Antigravity: state dir {} ({}) | Credential Manager gemini:antigravity {} | language_server {}",
+        "Antigravity: state dir {} ({}) | credential store gemini:antigravity {} | language_server {}",
         root,
         if has_root { "present" } else { "missing" },
-        match cred {
-            Some(c) => format!("found ({}, {})", c.auth_method, if c.expired { "expired" } else { "valid" }),
+        match credential {
+            Some(credential) => format!(
+                "found ({}, {})",
+                credential.auth_method,
+                if credential.expired { "expired" } else { "valid" }
+            ),
             None => "not found".into(),
         },
-        match ep {
-            Some(e) => format!("running, ports {:?}", e.ports),
+        match endpoint {
+            Some(endpoint) => format!("running, ports {:?}", endpoint.ports),
             None => "not running".into(),
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_remaining_fraction_becomes_used_fraction() {
+        let value = serde_json::json!({
+            "response": {
+                "groups": [{
+                    "displayName": "Gemini",
+                    "buckets": [{
+                        "bucketId": "weekly",
+                        "remainingFraction": 0.75,
+                        "resetTime": "2030-01-01T00:00:00Z"
+                    }]
+                }]
+            }
+        });
+        let windows = windows_from_bridge(&value);
+        assert_eq!(windows.len(), 1);
+        assert!((windows[0].used - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn credential_decode_keeps_secret_internal() {
+        let raw = br#"{"auth_method":"consumer","token":{"access_token":"secret-value","expiry":"2030-01-01T00:00:00Z"}}"#;
+        let credential = decode_credential(raw).expect("valid Antigravity credential");
+        assert_eq!(credential.access_token, "secret-value");
+        assert_eq!(credential.auth_method, "consumer");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_flag_parser_accepts_split_and_equals_forms() {
+        let split = vec!["language_server".into(), "--csrf_token".into(), "abc".into()];
+        let equals = vec!["language_server".into(), "--csrf_token=xyz".into()];
+        assert_eq!(flag_value_args(&split, "--csrf_token").as_deref(), Some("abc"));
+        assert_eq!(flag_value_args(&equals, "--csrf_token").as_deref(), Some("xyz"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_net_parser_filters_listening_sockets_by_inode() {
+        let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:ABCD 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 4242 1\n   1: 0100007F:1234 00000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 4242 1\n   2: 0100007F:2345 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9999 1\n";
+        let inodes = std::collections::HashSet::from([4242]);
+        assert_eq!(parse_proc_net_listening_ports(text, &inodes), vec![0xABCD]);
+    }
 }
