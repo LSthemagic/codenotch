@@ -41,6 +41,8 @@ jobs:
             xdg-utils
       - name: Cargo check
         run: cargo check --workspace
+      - name: Verify Cargo.lock is up to date
+        run: git diff --exit-code -- Cargo.lock
       - name: Cargo test
         run: cargo test --workspace
       - name: Install Tauri CLI
