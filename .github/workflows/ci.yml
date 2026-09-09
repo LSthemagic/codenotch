@@ -30,9 +30,17 @@ jobs:
           $hostTriple = (rustc -vV | Select-String '^host: ' | ForEach-Object { $_.Line.Substring(6) }).Trim()
           $sidecar = "nyrva/binaries/nyrva-hook-$hostTriple.exe"
           if (-not (Test-Path $sidecar)) { throw "missing prepared sidecar: $sidecar" }
+
           $installer = Get-ChildItem target/release/bundle/nsis -Filter '*.exe' | Select-Object -First 1
           if (-not $installer) { throw 'missing NSIS installer' }
           Write-Host "installer=$($installer.FullName)"
+
+          $manifest = (& 7z l $installer.FullName | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw '7z could not inspect the NSIS installer' }
+          if ($manifest -notmatch '(?i)nyrva-hook\.exe') {
+            Write-Host $manifest
+            throw 'NSIS installer does not contain nyrva-hook.exe'
+          }
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
