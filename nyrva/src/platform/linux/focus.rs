@@ -66,7 +66,8 @@ fn client_windows<C: Connection>(conn: &C, root: Window) -> Vec<Window> {
             .ok()?
             .reply()
             .ok()?;
-        Some(reply.value32()?.collect::<Vec<_>>())
+        let windows = reply.value32()?.collect::<Vec<_>>();
+        Some(windows)
     });
     let fallback = conn
         .query_tree(root)
