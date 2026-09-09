@@ -1,7 +1,7 @@
 //! Codex usage adapter, implemented from the upstream Codenotch's documented behaviour.
 //!
 //! Two data paths (the same trade-off upstream made in 1.5.0):
-//!   1. Live: borrow the session Codex keeps in `~/.codex/auth.json` (`tokens.access_token` +
+//!   1. Live: borrow the session Codex keeps in `CODEX_HOME/auth.json` (`tokens.access_token` +
 //!      `tokens.account_id`) and GET `https://chatgpt.com/backend-api/wham/usage`. The reply carries
 //!      `rate_limit.{primary_window,secondary_window}` with `used_percent / limit_window_seconds /
 //!      reset_at (seconds) | reset_after_seconds`, plus a top-level `plan_type`. That is the number
@@ -11,7 +11,7 @@
 //!      minutes, needed taskkill to clean up, and only ever reported the weekly window; the
 //!      five-hour window came back with the endpoint.)
 //!   2. Fallback: Codex writes the limits it saw on each turn into the thread's rollout log
-//!      `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, as lines like
+//!      `CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`, as lines like
 //!      `{"timestamp":"…","type":"event_msg","payload":{"type":"token_count","rate_limits":{
 //!         "primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1790585719},
 //!         "secondary":{…}|null,"plan_type":"free"}}}`
@@ -22,6 +22,7 @@
 //!   the dated directories newest-first and picks by mtime, with no SQLite involved (and none of
 //!   the immutable/WAL pitfalls).
 //!
+//! `CODEX_HOME` is honoured when non-empty and otherwise resolves to `~/.codex`.
 //! Credentials are borrowed, never managed: the numbers come from Codex's own sign-in and Codex's
 //! own endpoint. No sign-in and no session history at all means absent (no cell is shown).
 
@@ -65,6 +66,29 @@ fn codex_home() -> Option<PathBuf> {
     codex_home_from(env.as_deref(), home.as_deref())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexPaths {
+    pub auth: PathBuf,
+    pub sessions: PathBuf,
+    pub thread_history: PathBuf,
+    pub state: PathBuf,
+    pub bin: PathBuf,
+}
+
+fn codex_paths_from(home: &Path) -> CodexPaths {
+    CodexPaths {
+        auth: home.join("auth.json"),
+        sessions: home.join("sessions"),
+        thread_history: home.join("thread_history_1.sqlite"),
+        state: home.join("state_5.sqlite"),
+        bin: home.join("bin"),
+    }
+}
+
+pub(crate) fn codex_paths() -> Option<CodexPaths> {
+    codex_home().map(|home| codex_paths_from(&home))
+}
+
 fn store_path() -> PathBuf {
     crate::config::config_path().with_file_name("codex.json")
 }
@@ -91,10 +115,31 @@ fn persist(s: &UsageSnapshot) {
 
 // ---------------- Locating the executable ----------------
 
-/// Candidates in order: the native exe inside the global npm package (cleanest — no cmd/node
-/// wrapper) → ~/.codex/bin → codex.exe / codex.cmd on PATH.
+fn executable_candidates(paths: Option<&CodexPaths>, path_dirs: &[PathBuf], windows: bool) -> Vec<PathBuf> {
+    let mut cands = Vec::new();
+    if let Some(paths) = paths {
+        if windows {
+            cands.push(paths.bin.join("codex.exe"));
+        }
+        cands.push(paths.bin.join("codex"));
+    }
+    for dir in path_dirs {
+        if windows {
+            cands.push(dir.join("codex.exe"));
+            cands.push(dir.join("codex.cmd"));
+        } else {
+            cands.push(dir.join("codex"));
+        }
+    }
+    cands
+}
+
+/// Candidates in order: Windows native npm package (when available) → CODEX_HOME/bin → PATH.
+/// Linux intentionally uses only the deterministic CODEX_HOME and PATH candidates.
 pub fn find_executable() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
+
+    #[cfg(windows)]
     if let Some(appdata) = dirs::config_dir() {
         let pkg = appdata.join("npm").join("node_modules").join("@openai").join("codex");
         if let Ok(rd) = std::fs::read_dir(pkg.join("bin")) {
@@ -116,23 +161,19 @@ pub fn find_executable() -> Option<PathBuf> {
         }
         cands.push(appdata.join("npm").join("codex.cmd"));
     }
-    if let Some(h) = codex_home() {
-        cands.push(h.join("bin").join("codex.exe"));
-        cands.push(h.join("bin").join("codex"));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            cands.push(dir.join("codex.exe"));
-            cands.push(dir.join("codex.cmd"));
-        }
-    }
+
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let paths = codex_paths();
+    cands.extend(executable_candidates(paths.as_ref(), &path_dirs, cfg!(windows)));
     cands.into_iter().find(|p| p.is_file())
 }
 
 // ---------------- Live: the usage endpoint ----------------
 
 fn auth_path() -> Option<PathBuf> {
-    codex_home().map(|h| h.join("auth.json"))
+    codex_paths().map(|paths| paths.auth)
 }
 
 struct Credential {
@@ -185,13 +226,18 @@ enum LiveErr {
     Other(String),
 }
 
+fn user_agent_for(platform: &str) -> String {
+    format!("nyrva/{} ({platform})", env!("CARGO_PKG_VERSION"))
+}
+
 fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
+    let user_agent = user_agent_for(std::env::consts::OS);
     let resp = ureq::get(ENDPOINT)
         .set("Authorization", &format!("Bearer {}", cred.access_token))
         .set("ChatGPT-Account-Id", &cred.account_id)
         .set("Accept", "application/json")
         .set("Cache-Control", "no-cache, no-store")
-        .set("User-Agent", concat!("codenotch/", env!("CARGO_PKG_VERSION"), " (Windows)"))
+        .set("User-Agent", &user_agent)
         .timeout(Duration::from_secs(15))
         .call();
     match resp {
@@ -277,7 +323,7 @@ fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
 
 /// The most recently modified rollout: dated directories newest-first, looking only at the three most recent days that have files
 pub fn newest_rollout() -> Option<PathBuf> {
-    let root = codex_home()?.join("sessions");
+    let root = codex_paths()?.sessions;
     let mut days: Vec<PathBuf> = Vec::new();
     let mut years = list_dirs(&root);
     years.sort_by(|a, b| b.cmp(a));
@@ -375,7 +421,7 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
 pub fn present() -> bool {
     find_executable().is_some()
         || auth_path().map(|p| p.is_file()).unwrap_or(false)
-        || codex_home().map(|h| h.join("sessions").is_dir()).unwrap_or(false)
+        || codex_paths().map(|paths| paths.sessions.is_dir()).unwrap_or(false)
 }
 
 fn read_once() -> UsageSnapshot {
