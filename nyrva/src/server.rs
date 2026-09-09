@@ -1,4 +1,4 @@
-//! Local event server: receives codenotch-hook's POST /event?e=<event>&ppid=<pid>
+//! Local event server: receives nyrva-hook's POST /event?e=<event>&ppid=<pid>
 //! with the Claude Code hook's stdin JSON as the body. Lenient parsing: no missing field is an error.
 
 use crate::state::HookEvent;
@@ -6,12 +6,48 @@ use crate::AppState;
 use std::io::Read;
 use tauri::{AppHandle, Manager};
 
+#[cfg(target_os = "linux")]
+fn start_linux_ack_scan(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let need = {
+            let st = app.state::<AppState>();
+            let store = st.store.lock().unwrap();
+            store.has_done()
+        };
+        if !need { continue; }
+
+        let fg = crate::focus::fg_pid();
+        if fg == 0 { continue; }
+        let maps = crate::focus::proc_maps();
+        let changed = {
+            let st = app.state::<AppState>();
+            let mut store = st.store.lock().unwrap();
+            store.ack_done(|session| {
+                // Claude Desktop Linux is outside M4; hook-backed Claude Code sessions have a ppid.
+                session.ppid != 0
+                    && crate::focus::pid_hits_chain(
+                        fg,
+                        &crate::focus::chain_of(session.ppid, &maps.ppid),
+                        &maps,
+                    )
+            })
+        };
+        if changed {
+            crate::broadcast(&app);
+        }
+    });
+}
+
 pub fn start(app: AppHandle, port: u16) {
+    #[cfg(target_os = "linux")]
+    start_linux_ack_scan(app.clone());
+
     std::thread::spawn(move || {
         let server = match tiny_http::Server::http(("127.0.0.1", port)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[codenotch] failed to bind port {port}: {e} (is another instance running?)");
+                eprintln!("[nyrva] failed to bind port {port}: {e} (is another instance running?)");
                 return;
             }
         };
