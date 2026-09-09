@@ -87,8 +87,8 @@ fn parent_pid() -> u32 { std::os::unix::process::parent_id() }
 
 #[cfg(test)]
 mod tests {
-    use super::{config_path, main_binary_name};
-    use std::path::Path;
+    use super::{config_path, launch_target_from_json, main_binary_name};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn main_binary_name_matches_platform() {
@@ -102,5 +102,19 @@ mod tests {
     fn config_path_uses_nyrva_config_namespace() {
         let path = config_path().expect("config directory should be available in supported desktop environments");
         assert!(path.ends_with(Path::new("nyrva").join("config.json")));
+    }
+
+    #[test]
+    fn persisted_launcher_path_is_read_from_config_json() {
+        let json = r#"{"port":48666,"launcher_path":"/home/alice/Apps/Nyrva.AppImage"}"#;
+        assert_eq!(
+            launch_target_from_json(json),
+            Some(PathBuf::from("/home/alice/Apps/Nyrva.AppImage"))
+        );
+    }
+
+    #[test]
+    fn missing_launcher_path_returns_none() {
+        assert_eq!(launch_target_from_json(r#"{"port":48666}"#), None);
     }
 }
