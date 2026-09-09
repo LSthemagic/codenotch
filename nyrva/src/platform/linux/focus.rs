@@ -48,7 +48,8 @@ fn window_pid<C: Connection>(conn: &C, window: Window, pid_atom: Atom) -> Option
         .ok()?
         .reply()
         .ok()?;
-    reply.value32()?.next()
+    let mut values = reply.value32()?;
+    values.next()
 }
 
 pub fn fg_pid() -> u32 {
